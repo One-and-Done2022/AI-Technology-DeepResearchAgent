@@ -9,11 +9,10 @@
 """
 from __future__ import annotations
 
-import json
-import re
 from typing import Any
 
 from .base_agent import BaseAgent
+from ..evidence.extractor import EvidencePipeline
 from ..orchestrator.schemas import SubTask, AgentResult, AgentStatus, ResearchReport
 from ..utils.tracing import trace_agent
 
@@ -30,6 +29,7 @@ class SummarizerAgent(BaseAgent):
 
     def __init__(self, name: str, policy, tools: list | None = None) -> None:
         super().__init__(name, policy, tools)
+        self.evidence_pipeline = EvidencePipeline()
 
     @trace_agent(name="summarizer.run", tags=["agent", "summarizer"])
     async def run(self, task: SubTask, context: dict) -> AgentResult:
@@ -63,7 +63,8 @@ class SummarizerAgent(BaseAgent):
             )
 
         # 构建 synthesis prompt
-        prompt = self._build_synthesis_prompt(query, results)
+        sources = self._collect_sources(results)
+        prompt = self._build_synthesis_prompt(query, results, sources)
         messages = [
             {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": prompt},
@@ -89,7 +90,7 @@ class SummarizerAgent(BaseAgent):
         token_usage = len(content) // 3  # 简化估算
 
         # 解析报告内容，提取来源和置信度
-        report = self._parse_report(query, content, results)
+        report = self._parse_report(query, content, results, sources)
 
         return AgentResult(
             task_id=task.task_id,
@@ -102,16 +103,20 @@ class SummarizerAgent(BaseAgent):
 
     def _system_prompt(self) -> str:
         return (
-            "You are an expert research synthesizer. "
-            "Your task is to integrate multiple research findings into a coherent, well-structured report. "
-            "Use Markdown formatting. Cite sources explicitly. "
-            "The report body MUST be at least 3000 Chinese characters (or 2000 English words) long. "
-            "Write in depth: include background, key findings, detailed analysis, comparisons, and implications. "
-            "DO NOT describe what you will do — directly output the synthesized report. "
-            "At the end, provide an overall confidence score (0-1) and a summary of key sources."
+            "You are the synthesis component of an AI technology intelligence system. "
+            "Write a concise but complete Markdown report for AI, software systems, or open-source technology research. "
+            "Every factual or quantitative claim must cite one or more evidence catalog IDs such as [S1]. "
+            "Never create a source ID that is not in the catalog. Distinguish verified facts, analysis, and uncertainty. "
+            "When evidence conflicts, describe the conflict instead of silently choosing a side. "
+            "Report length must follow available evidence; do not pad the answer to a fixed length."
         )
 
-    def _build_synthesis_prompt(self, query: str, results: list[AgentResult]) -> str:
+    def _build_synthesis_prompt(
+        self,
+        query: str,
+        results: list[AgentResult],
+        sources: list[dict[str, Any]],
+    ) -> str:
         """构建合成 prompt，按置信度降序排列结果。"""
         sorted_results = sorted(results, key=lambda r: r.confidence, reverse=True)
 
@@ -127,73 +132,47 @@ class SummarizerAgent(BaseAgent):
                 f"Output:\n{r.output}\n"
             )
 
+        parts.append(f"\n# Evidence Catalog ({len(sources)} sources)\n")
+        for source in sources:
+            parts.append(
+                f"[{source['source_id']}] {source.get('title') or 'Untitled'}\n"
+                f"URL: {source.get('url', '')}\n"
+                f"Type: {source.get('source_type', 'unknown')} | Quality: {source.get('quality_score', 0):.2f}\n"
+                f"Evidence excerpt: {(source.get('quote') or source.get('snippet', ''))[:1200]}\n"
+            )
+
         parts.append(
             "\n# Instructions\n"
-            "1. Directly write the synthesized report based on the findings above. Do NOT say 'I will synthesize'.\n"
-            "2. The report MUST be comprehensive and detailed (at least 3000 Chinese characters or 2000 English words).\n"
-            "3. Structure: Executive Summary → Background → Key Findings (with details) → Analysis → Comparisons → Implications → Conclusion.\n"
-            "4. Resolve any contradictions between sources.\n"
-            "5. Explicitly list all sources cited.\n"
-            "6. End with: Overall Confidence: X.XX"
+            "1. Directly write the report; do not describe a future plan.\n"
+            "2. Use this structure: Executive Summary → Scope/As-of Date → Key Findings → Technical Comparison → Risks/Unknowns → Recommendation.\n"
+            "3. Put [S#] immediately after every factual, quantitative, version, performance, or ecosystem claim.\n"
+            "4. Use only evidence catalog IDs. If evidence is insufficient, explicitly write '证据不足'.\n"
+            "5. Explain source conflicts and avoid converting inference into fact.\n"
+            "6. For technology selection questions, include a comparison table.\n"
+            "7. End with a short confidence and limitations section."
         )
         return "\n".join(parts)
 
-    def _parse_report(self, query: str, content: str, results: list[AgentResult]) -> ResearchReport:
+    def _parse_report(
+        self,
+        query: str,
+        content: str,
+        results: list[AgentResult],
+        sources: list[dict[str, Any]],
+    ) -> ResearchReport:
         """从 LLM 输出中解析 ResearchReport，并基于子任务成功率校准置信度。"""
-        # 1. 从文本中提取 LLM 自评置信度
-        llm_confidence = 0.5
-        m = re.search(r"[Oo]verall\s+[Cc]onfidence[:\s]+(0\.\d+|1\.0|1)", content)
-        if m:
-            try:
-                llm_confidence = float(m.group(1))
-            except ValueError:
-                pass
-
-        # 2. 基于子任务成功率计算客观置信度
+        # 基于子任务成功率和可验证证据计算置信度，避免依赖模型自评。
         total = len(results)
         success = sum(1 for r in results if r.status == AgentStatus.SUCCESS)
         success_rate = success / max(total, 1)
 
-        # 3. 综合置信度 = LLM 自评 × 成功率开根（降低成功率的影响权重）
-        confidence = llm_confidence * (success_rate ** 0.5)
-        confidence = round(max(0.0, min(1.0, confidence)), 2)
-
-        # 收集来源（从各个子结果的轨迹中提取）
-        sources: list[dict] = []
-        for r in results:
-            if r.status != AgentStatus.SUCCESS:
-                continue
-            # 简单启发式：从 trajectory 的 tool 结果中提取 url
-            for step in r.trajectory:
-                if step.get("role") == "tool" and isinstance(step.get("result"), dict):
-                    res = step["result"]
-                    if "results" in res and isinstance(res["results"], list):
-                        for item in res["results"]:
-                            if isinstance(item, dict) and "url" in item:
-                                sources.append({
-                                    "url": item["url"],
-                                    "title": item.get("title", ""),
-                                    "snippet": item.get("snippet", ""),
-                                    "task_id": r.task_id,
-                                })
-                    elif "papers" in res and isinstance(res["papers"], list):
-                        for paper in res["papers"]:
-                            if isinstance(paper, dict) and "pdf_url" in paper:
-                                sources.append({
-                                    "url": paper["pdf_url"],
-                                    "title": paper.get("title", ""),
-                                    "snippet": paper.get("summary", "")[:200],
-                                    "task_id": r.task_id,
-                                })
-
-        # 去重
-        seen = set()
-        unique_sources = []
-        for s in sources:
-            key = s["url"]
-            if key not in seen:
-                seen.add(key)
-                unique_sources.append(s)
+        claims, evidence_metrics = self.evidence_pipeline.refresh(content, sources)
+        evidence_confidence = float(evidence_metrics.get("citation_entailment", 0.0))
+        citation_coverage = float(evidence_metrics.get("citation_coverage", 0.0))
+        confidence = round(
+            max(0.0, min(1.0, 0.4 * success_rate + 0.4 * evidence_confidence + 0.2 * citation_coverage)),
+            3,
+        )
 
         # 统计实际工具调用次数（遍历所有子任务的 trajectory）
         num_searches = sum(
@@ -204,7 +183,29 @@ class SummarizerAgent(BaseAgent):
         return ResearchReport(
             query=query,
             content=content,
-            sources=unique_sources,
+            sources=sources,
             confidence=confidence,
             num_searches=num_searches,
+            claims=claims,
+            evidence_metrics=evidence_metrics,
         )
+
+    @staticmethod
+    def _collect_sources(results: list[AgentResult]) -> list[dict[str, Any]]:
+        unique: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for result in results:
+            if result.status != AgentStatus.SUCCESS:
+                continue
+            for raw in result.sources:
+                source = dict(raw)
+                key = str(source.get("url") or source.get("content_hash") or "")
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                source["source_id"] = f"S{len(unique) + 1}"
+                source.setdefault("quote", source.get("snippet", ""))
+                source.setdefault("snippet", source.get("quote", ""))
+                source["task_id"] = result.task_id
+                unique.append(source)
+        return unique

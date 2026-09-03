@@ -3,7 +3,7 @@
 """
 scripts/run_single.py
 ================================================================================
-DeepResearch Agent 单条查询运行脚本。
+AI Technology Research Agent 单条查询运行脚本。
 
 Usage:
     python scripts/run_single.py --query "你的研究问题" [--config path/to/config.yaml]
@@ -23,23 +23,30 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.core.runner import initialize_modules, load_config, run_research, save_report, setup_logging
+from src.core.runner import (
+    format_report,
+    initialize_modules,
+    load_config,
+    run_research_report,
+    save_report,
+    save_structured_report,
+    setup_logging,
+)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="DeepResearch Agent 单条查询运行脚本",
+        description="AI Technology Research Agent 单条查询运行脚本",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python scripts/run_single.py --query "分析 2024 年 AI 芯片市场格局"
-  python scripts/run_single.py --query "量子计算在密码学中的应用" --config configs/custom.yaml
+  python scripts/run_single.py --query "对比 vLLM、SGLang 与 TensorRT-LLM"
+  python scripts/run_single.py --query "分析某开源 Agent 框架的生产可用性" --config configs/custom.yaml
         """,
     )
     parser.add_argument("--query", type=str, required=True, help="用户的研究问题（必填）")
     parser.add_argument("--config", type=str, default=None, help="自定义配置文件路径")
     parser.add_argument("--output_dir", type=str, default="outputs/reports", help="报告输出目录")
-    parser.add_argument("--session_id", type=str, default="", help="会话 ID（用于 memory store 隔离）")
     parser.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
@@ -78,11 +85,16 @@ def main() -> None:
         config = load_config(args.config)
         logger.info(f"配置加载完成: {args.config or 'configs/default.yaml'}")
 
-        modules = initialize_modules(config, session_id=args.session_id)
-        report = asyncio.run(run_research(args.query, config, modules))
+        modules = initialize_modules(config)
+        started_at = _dt.datetime.now().timestamp()
+        structured_report = asyncio.run(run_research_report(args.query, config, modules))
+        elapsed = _dt.datetime.now().timestamp() - started_at
+        report = format_report(structured_report, elapsed)
 
         filepath = save_report(report, args.query, args.output_dir)
+        json_filepath = save_structured_report(structured_report, args.output_dir)
         logger.info(f"报告已保存: {filepath}")
+        logger.info(f"结构化证据已保存: {json_filepath}")
 
         print("\n" + "=" * 60)
         print("最终研究报告")

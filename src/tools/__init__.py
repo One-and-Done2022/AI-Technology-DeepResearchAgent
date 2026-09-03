@@ -8,6 +8,7 @@ from .browser import BrowserTool, MockBrowserTool, BaseBrowserTool, get_browser_
 from .file_reader import FileReaderTool
 from .calculator import CalculatorTool
 from .notepad import NotepadTool, NotepadEntry
+from .github_reader import GitHubReaderTool, MockGitHubReaderTool
 
 __all__ = [
     # 搜索与阅读
@@ -26,4 +27,6 @@ __all__ = [
     # 辅助
     "NotepadTool",
     "NotepadEntry",
+    "GitHubReaderTool",
+    "MockGitHubReaderTool",
 ]

@@ -127,9 +127,9 @@ def trace_block(
     """上下文管理器：手动包裹一段代码块。
 
     用法示例：
-        with trace_block("adversarial_loop", run_type="chain", inputs={"query": q}) as run:
-            report = await loop.run(report)
-            run.add_output({"score": report.final_score})
+        with trace_block("evidence_verification", run_type="chain", inputs={"query": q}) as run:
+            report = await verifier.run(report)
+            run.add_output({"citation_entailment": report.evidence_metrics.get("citation_entailment", 0.0)})
     """
     if not is_tracing_enabled():
         # 返回一个 dummy context manager

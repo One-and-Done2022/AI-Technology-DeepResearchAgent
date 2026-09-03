@@ -1,4 +1,4 @@
-"""Planner 子包：M2 自适应规划层。"""
+"""Planner 子包：领域研究 DAG 规划层。"""
 from __future__ import annotations
 
 # 为避免循环导入，请直接从子模块导入：

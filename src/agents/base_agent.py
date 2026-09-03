@@ -43,7 +43,7 @@ class BaseAgent(ABC):
 
         Args:
             task: 待执行的原子任务。
-            context: 全局共享上下文（Memory 的快照），只读。
+            context: 当前运行上下文快照，只读。
 
         Returns:
             AgentResult: 包含状态、输出、轨迹等。

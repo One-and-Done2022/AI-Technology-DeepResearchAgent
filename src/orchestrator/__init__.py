@@ -1,4 +1,4 @@
-"""Orchestrator 子包：M1 编排层核心。"""
+"""Orchestrator 子包：异步研究编排核心。"""
 from __future__ import annotations
 
 # 注意：为避免循环导入，不在 __init__ 中导入 orchestrator.Orchestrator

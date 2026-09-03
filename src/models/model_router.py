@@ -133,7 +133,7 @@ class ModelRouter:
         base_url = get_env(f"{prefix}_BASE_URL")
         model = get_env(f"{prefix}_MODEL")
 
-        if api_key is None and base_url is None:
+        if api_key is None and base_url is None and name != "vllm":
             raise ValueError(
                 f"后端 '{name}' 未配置。请在 .env 或 .env.local 中设置 "
                 f"{prefix}_API_KEY 和/或 {prefix}_BASE_URL。"

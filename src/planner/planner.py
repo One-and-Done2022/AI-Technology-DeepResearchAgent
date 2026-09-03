@@ -50,7 +50,9 @@ Return a JSON object with this exact structure (no markdown, no extra text):
       "timeout_seconds": 120,
       "priority": 1,
       "expected_type": "factual",
-      "search_hints": ["keyword1", "keyword2"]
+      "search_hints": ["keyword1", "keyword2"],
+      "source_requirements": ["paper", "official_doc", "official_repository"],
+      "verification_required": true
     }}
   ]
 }}
@@ -59,13 +61,15 @@ Return a JSON object with this exact structure (no markdown, no extra text):
 1. task_type must be one of: search, analyze, verify
 2. dependencies must reference existing task_id values
 3. The graph must be a DAG (no cycles)
-4. Generate 3 to 8 sub_tasks
+4. Generate 4 to 8 sub_tasks. Cover papers, official documentation, implementation evidence, and verification when relevant.
 5. More fundamental/information-gathering tasks should have fewer dependencies
 6. Verification tasks should depend on analysis tasks
 7. Use concise but clear descriptions
 8. CRITICAL — RELEVANCE CONSTRAINT: Each sub-task description MUST directly address the research question. If the user asks about 'internship/job application', do NOT generate tasks about 'technology trends', 'annual news summary', or 'science breakthroughs'.
 9. The search_hints field MUST contain keywords directly from the query. Do NOT invent unrelated keywords.
 10. Prefer specific, actionable queries over broad, vague ones.
+11. For AI and software technology questions, prefer primary sources: papers, official documentation, release notes, and official GitHub repositories.
+12. Add a verification task for quantitative, performance, cost, ranking, or trend claims.
 
 ## Anti-examples (DO NOT do this)
 - Query: "How to find an internship at a big tech company" → BAD tasks: "2025 technology trends", "annual science news", "latest AI breakthroughs"
@@ -339,6 +343,8 @@ class Planner:
             priority=int(item.get("priority", 1)),
             expected_type=item.get("expected_type", "factual"),
             search_hints=list(item.get("search_hints", [])),
+            source_requirements=list(item.get("source_requirements", [])),
+            verification_required=bool(item.get("verification_required", False)),
         )
 
     def get_task_map_from_dag(self, dag: DAG, raw_json: str) -> dict[str, SubTask]:

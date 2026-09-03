@@ -4,8 +4,7 @@
 执行搜索和分析类 SubTask，实现多轮 tool-calling 循环。
 设计为项目一 ToolAgentLoop 的简化版：
   - 单 trajectory，无批处理
-  - 支持 7 种工具：web_search, arxiv_reader, code_sandbox, browser,
-    file_reader, calculator, notepad
+  - 支持 Web、论文、GitHub、浏览器、代码、文件、计算和笔记工具
   - 通过 VLLMPolicy 进行 LLM 调用
   - 工具结果回写后自动继续，直到模型不再调用工具或达到 max_turns
 """
@@ -16,6 +15,8 @@ import json
 from typing import Any
 
 from .base_agent import BaseAgent
+from ..evidence.extractor import EvidencePipeline
+from ..evidence.verifier import EvidenceVerifier
 from ..orchestrator.schemas import SubTask, AgentResult, AgentStatus
 from ..utils.tracing import trace_agent
 
@@ -26,7 +27,7 @@ __all__ = ["ResearcherAgent"]
 class ResearcherAgent(BaseAgent):
     """研究员 Agent：负责搜索、分析、验证类任务。
 
-    可用工具（7 个）：
+    可用工具：
       - web_search:   网页搜索，返回标题/链接/摘要
       - browser:      网页阅读器，打开 URL 提取正文
       - arxiv_reader: ArXiv 论文元数据检索
@@ -34,6 +35,7 @@ class ResearcherAgent(BaseAgent):
       - code_sandbox: Python 代码沙箱执行
       - calculator:   轻量数学计算（比沙箱更快更安全）
       - notepad:      草稿笔记（记录中间结论/待办/搜索策略）
+      - github_reader: GitHub 仓库元数据、README、许可证和 Release
 
     Attributes:
         max_turns: 最大交互轮数，防止无限循环。
@@ -46,10 +48,20 @@ class ResearcherAgent(BaseAgent):
         policy,
         tools: list | None = None,
         max_turns: int = 10,
+        max_tool_calls: int = 6,
+        support_threshold: float = 0.22,
+        partial_threshold: float = 0.08,
     ) -> None:
         super().__init__(name, policy, tools)
         self.max_turns = max_turns
+        self.max_tool_calls = max(1, max_tool_calls)
         self.tool_map: dict[str, Any] = {t.name: t for t in (tools or [])}
+        self.evidence_pipeline = EvidencePipeline(
+            EvidenceVerifier(
+                support_threshold=support_threshold,
+                partial_threshold=partial_threshold,
+            )
+        )
 
     @trace_agent(name="researcher.run", tags=["agent", "researcher"])
     async def run(self, task: SubTask, context: dict) -> AgentResult:
@@ -76,13 +88,11 @@ class ResearcherAgent(BaseAgent):
             try:
                 response = self.policy(messages)
                 content = response.get("content", "") or ""
-                return AgentResult(
+                return self._build_success_result(
                     task_id=task.task_id,
-                    status=AgentStatus.SUCCESS,
-                    output=content,
+                    content=content,
                     trajectory=[{"role": "assistant", "content": content}],
                     token_usage=len(content) // 3,
-                    confidence=self._extract_confidence(content),
                 )
             except Exception as e:
                 return AgentResult(
@@ -107,7 +117,11 @@ class ResearcherAgent(BaseAgent):
         # 根据任务类型确定 fallback 工具
         desc_lower = (task.description or "").lower()
         academic_keywords = ["论文", "paper", "publication", "学术", "arxiv", "neurips", "icml", "iclr", "scholar", "citation", "文献"]
-        fallback_tool = "arxiv_reader" if any(kw in desc_lower for kw in academic_keywords) else "web_search"
+        github_keywords = ["github", "repository", "repo", "开源项目", "仓库", "release"]
+        if any(kw in desc_lower for kw in github_keywords):
+            fallback_tool = "github_reader"
+        else:
+            fallback_tool = "arxiv_reader" if any(kw in desc_lower for kw in academic_keywords) else "web_search"
         
         for turn in range(self.max_turns):
             # Fallback: if last turn had no tool_calls, force a search instruction
@@ -163,14 +177,11 @@ class ResearcherAgent(BaseAgent):
                         token_usage=total_tokens,
                         confidence=0.0,
                     )
-                confidence = self._extract_confidence(content)
-                return AgentResult(
+                return self._build_success_result(
                     task_id=task.task_id,
-                    status=AgentStatus.SUCCESS,
-                    output=content,
+                    content=content,
                     trajectory=trajectory,
                     token_usage=total_tokens,
-                    confidence=confidence,
                 )
 
             # 执行工具调用
@@ -188,25 +199,27 @@ class ResearcherAgent(BaseAgent):
                 # B方案：检测工具返回结果是否包含 error 字段
                 if isinstance(result, dict) and result.get("error"):
                     error_msg = result["error"]
+                    tool_results.append({
+                        "tool_call_id": tc.get("id", ""),
+                        "name": tool_name,
+                        "arguments": args,
+                        "result": result,
+                    })
                     trajectory.append({
                         "turn": turn,
                         "role": "tool",
                         "tool_call_id": tc.get("id", ""),
                         "name": tool_name,
+                        "arguments": args,
                         "error": error_msg,
+                        "result": result,
                     })
-                    return AgentResult(
-                        task_id=task.task_id,
-                        status=AgentStatus.FAILED,
-                        output=f"Tool '{tool_name}' failed: {error_msg}",
-                        trajectory=trajectory,
-                        token_usage=total_tokens,
-                        confidence=0.0,
-                    )
+                    continue
 
                 tool_results.append({
                     "tool_call_id": tc.get("id", ""),
                     "name": tool_name,
+                    "arguments": args,
                     "result": result,
                 })
                 trajectory.append({
@@ -214,27 +227,33 @@ class ResearcherAgent(BaseAgent):
                     "role": "tool",
                     "tool_call_id": tc.get("id", ""),
                     "name": tool_name,
+                    "arguments": args,
                     "result": result,
                 })
 
-            # 检测搜索结果是否全为空（工具返回了但无有效内容）
-            all_empty = True
+            # 检测是否获得了任意可用 observation；失败结果会反馈给模型以切换后端/工具。
+            has_usable_observation = False
             for tr in tool_results:
+                res = tr["result"]
                 if tr["name"] == "web_search":
-                    res = tr["result"]
                     if isinstance(res, dict) and res.get("results"):
                         for r in res["results"]:
                             if r.get("snippet", "").strip():
-                                all_empty = False
+                                has_usable_observation = True
                                 break
+                elif isinstance(res, dict) and not res.get("error"):
+                    has_usable_observation = has_usable_observation or bool(
+                        res.get("papers")
+                        or res.get("readme")
+                        or res.get("stdout")
+                        or res.get("return_value") is not None
+                    )
+                elif isinstance(res, str) and res.strip():
+                    has_usable_observation = True
             
-            # 如果已搜索 2+ 轮或搜索结果全空，强制要求总结
-            search_count = sum(1 for t in trajectory if t.get("role") == "tool" and t.get("name") == "web_search")
-            force_summary = False
-            if search_count >= 2:
-                force_summary = True
-            if all_empty and tool_results:
-                force_summary = True
+            # 达到全局工具预算后强制总结；不同来源可以在预算内交叉核验。
+            tool_call_count = sum(1 for t in trajectory if t.get("role") == "tool")
+            force_summary = tool_call_count >= self.max_tool_calls
 
             # 将 assistant message 和 tool results 追加到 messages
             assistant_msg = {
@@ -250,6 +269,9 @@ class ResearcherAgent(BaseAgent):
 
             for tr in tool_results:
                 msg_content = json.dumps(tr["result"], ensure_ascii=False, default=str)
+                tool_failed = isinstance(tr["result"], dict) and bool(tr["result"].get("error"))
+                if not has_usable_observation and tool_failed:
+                    msg_content += "\n\n[SYSTEM NOTICE] This tool failed. Try an alternative source or backend within the remaining tool budget."
                 # 如果强制总结，给工具结果附加提示
                 if force_summary:
                     msg_content += "\n\n[SYSTEM NOTICE] You have already searched enough. Write your final summary NOW. Do NOT call any more tools."
@@ -278,6 +300,8 @@ class ResearcherAgent(BaseAgent):
             "  Use this as the FIRST tool for most tasks.\n"
             "- arxiv_reader: Academic paper search (ArXiv / Semantic Scholar). "
             "  USE when the task involves: papers, publications, academic research, citation counts.\n"
+            "- github_reader: Inspect repository metadata, README, license, activity, and releases. "
+            "  USE for open-source frameworks, implementation evidence, or project due diligence.\n"
             "- browser: Open a URL and extract full webpage text. "
             "  USE after web_search when search results are too short and you need to read the original article in depth.\n"
             "- code_sandbox: Execute Python code for calculations, data processing, simulations. "
@@ -294,10 +318,10 @@ class ResearcherAgent(BaseAgent):
             "3. For most research tasks, START with web_search or arxiv_reader.\n"
             "4. If search results are too short, use browser to read the full article.\n"
             "5. If the task involves numbers/calculations, use calculator or code_sandbox.\n"
-            "6. You may call tools AT MOST 2 times total. After that you MUST summarize.\n"
-            "7. Only after gathering information, provide a concise summary with a confidence score (0-1).\n"
+            f"6. You may call tools AT MOST {self.max_tool_calls} times total. Prefer at least two independent primary or official sources.\n"
+            "7. Only after gathering information, provide a concise evidence-first summary with source URLs and a confidence score (0-1).\n"
             "8. NEVER greet the user or ask what they want to search — just execute immediately.\n"
-            "9. If you have already performed 2 tool calls, do NOT call more — write the final summary now."
+            "9. Separate verified facts, analysis, and unresolved uncertainty. Never invent a citation."
         )
 
     def _system_prompt_direct_analysis(self) -> str:
@@ -343,6 +367,10 @@ class ResearcherAgent(BaseAgent):
         academic_keywords = ["论文", "paper", "publication", "学术", "arxiv", "neurips", "icml", "iclr", "scholar", "citation", "文献"]
         if any(kw in desc_lower for kw in academic_keywords):
             tool_recommendations.append("arxiv_reader")
+
+        github_keywords = ["github", "repository", "repo", "开源项目", "仓库", "release", "commit", "issue"]
+        if any(kw in desc_lower for kw in github_keywords):
+            tool_recommendations.append("github_reader")
         
         # 计算/数学类
         calc_keywords = ["计算", "flops", "显存", "内存", "参数量", "延迟", "成本", "公式", "数值", "统计", "数学", "公式", "推导"]
@@ -389,16 +417,20 @@ class ResearcherAgent(BaseAgent):
             "## INSTRUCTIONS:",
             f"1. First, call the '{primary_tool}' tool with a relevant query to gather information.",
             "2. Review the results.",
-            f"3. If needed, call '{primary_tool}' ONE MORE time with a refined query.",
-            "   You may call tools AT MOST 2 times total. After the 2nd call, you MUST write the final summary.",
+            f"3. If needed, call '{primary_tool}' again with a refined query or use a second source type.",
+            f"   You may call tools AT MOST {self.max_tool_calls} times total.",
             "4. If search results are too short, you may use 'browser' to read the full article (counts as 1 tool call).",
             "5. If calculations are needed, use 'calculator' or 'code_sandbox' (counts as 1 tool call).",
-            "6. Finally, summarize your findings in Chinese with a confidence score (0-1).",
+            "6. Finally, summarize findings in Chinese. Include source URLs, distinguish facts from analysis, and report uncertainty.",
             "7. DO NOT greet the user or ask clarifying questions — just execute immediately.",
             "8. IMPORTANT: Your query MUST directly address the task description.",
         ])
         if task.search_hints:
             lines.insert(1, f"Search hints (MUST use these as primary keywords): {', '.join(task.search_hints)}")
+        if task.source_requirements:
+            lines.insert(2, f"Required source types: {', '.join(task.source_requirements)}")
+        if task.verification_required:
+            lines.append("9. Verification is required: cross-check quantitative and comparative claims against primary sources.")
         if task.context_keys:
             ctx_parts = []
             for key in task.context_keys:
@@ -407,6 +439,19 @@ class ResearcherAgent(BaseAgent):
             if ctx_parts:
                 lines.append("\n## Context:")
                 lines.extend(ctx_parts)
+        dependency_results = [
+            (key, value)
+            for key, value in context.items()
+            if str(key).startswith("dep:")
+        ]
+        if dependency_results:
+            lines.append("\n## Dependency findings:")
+            for key, value in dependency_results:
+                output = getattr(value, "output", value)
+                lines.append(f"- {key}: {str(output)[:1800]}")
+        if context.get("research_workspace"):
+            lines.append("\n## Compact research workspace:")
+            lines.append(str(context["research_workspace"])[:2000])
         return "\n".join(lines)
 
     async def _execute_tool(self, tool_name: str, args: dict) -> dict:
@@ -453,3 +498,26 @@ class ResearcherAgent(BaseAgent):
                     continue
         # 默认中等置信度
         return 0.6
+
+    def _build_success_result(
+        self,
+        task_id: str,
+        content: str,
+        trajectory: list[dict],
+        token_usage: int,
+    ) -> AgentResult:
+        sources, claims, evidence_metrics = self.evidence_pipeline.build(content, trajectory)
+        evidence_confidence = float(evidence_metrics.get("citation_entailment", 0.0))
+        self_confidence = self._extract_confidence(content)
+        confidence = round(0.7 * self_confidence + 0.3 * evidence_confidence, 3)
+        return AgentResult(
+            task_id=task_id,
+            status=AgentStatus.SUCCESS,
+            output=content,
+            trajectory=trajectory,
+            token_usage=token_usage,
+            confidence=confidence,
+            sources=sources,
+            claims=claims,
+            evidence_metrics=evidence_metrics,
+        )

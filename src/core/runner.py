@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import json
 import sys
 import time
 from datetime import datetime
@@ -74,7 +75,7 @@ def load_config(config_path: str | None = None) -> dict:
 def _create_tools_factory(config: dict):
     """创建工具工厂函数，返回 Agent 可用的工具列表。"""
     tools_cfg = config.get("tools", {})
-    mock_mode = tools_cfg.get("web_search", {}).get("mock_mode", True)
+    mock_mode = bool(tools_cfg.get("mock_mode", False))
 
     from src.tools import (
         WebSearchTool,
@@ -86,6 +87,8 @@ def _create_tools_factory(config: dict):
         CodeSandboxTool,
         CalculatorTool,
         NotepadTool,
+        GitHubReaderTool,
+        MockGitHubReaderTool,
     )
 
     tools = {}
@@ -117,6 +120,14 @@ def _create_tools_factory(config: dict):
     # 7. notepad
     tools["notepad"] = NotepadTool()
 
+    # 8. GitHub repository intelligence
+    github_timeout = int(tools_cfg.get("github_timeout_seconds", 20))
+    tools["github_reader"] = (
+        MockGitHubReaderTool(timeout=github_timeout)
+        if mock_mode
+        else GitHubReaderTool(timeout=github_timeout)
+    )
+
     # 返回列表形式（AgentPool 和 Agent 构造函数需要 list）
     return list(tools.values())
 
@@ -124,13 +135,12 @@ def _create_tools_factory(config: dict):
 # ---------------------------------------------------------------------------
 # 模块初始化
 # ---------------------------------------------------------------------------
-def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
+def initialize_modules(config: dict) -> dict[str, Any]:
     """
     根据配置初始化所有核心模块。
 
     Args:
         config: 全局配置字典。
-        session_id: 会话 ID，用于 memory store 的 session 隔离。
 
     返回一个包含各模块实例的字典。
     """
@@ -176,7 +186,7 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
     # 若未配置分工，所有模块回退到 default_policy
     # ------------------------------------------------------------------
 
-    # M2: Adaptive Planner（Orchestrator 依赖 Planner，先初始化）
+    # Adaptive Planner（Orchestrator 依赖 Planner，先初始化）
     from src.planner.planner import Planner
     from src.planner.budget_tracker import BudgetTracker
 
@@ -184,68 +194,32 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
     budget_tracker = BudgetTracker()
     planner = Planner(policy=planner_policy, budget_tracker=budget_tracker)
     modules["planner"] = planner
-    logger.info("[M2] Planner 模块已初始化")
+    logger.info("Planner 模块已初始化")
 
-    # M3: Context Compressor
-    from src.compressor.compressor import ContextCompressor
+    evidence_cfg = config.get("evidence", {})
+    evidence_store = None
+    from src.evidence.extractor import EvidencePipeline
+    from src.evidence.verifier import EvidenceVerifier
 
-    compressor_policy = modules.get("compressor_policy", default_policy)
-    compressor_cfg = config.get("compressor", {})
-    compressor = ContextCompressor(
-        llm_policy=compressor_policy,
-        budget=compressor_cfg.get("max_context_length", 16000),
-        output_reserve=compressor_cfg.get("output_reserve_tokens", 2048),
+    evidence_pipeline = EvidencePipeline(
+        EvidenceVerifier(
+            support_threshold=float(evidence_cfg.get("support_threshold", 0.22)),
+            partial_threshold=float(evidence_cfg.get("partial_threshold", 0.08)),
+        )
     )
-    modules["compressor"] = compressor
-    logger.info("[M3] Compressor 模块已初始化")
+    if evidence_cfg.get("enabled", True):
+        from src.evidence.store import EvidenceStore
 
-    # M4: Shared Memory Store
-    from src.memory.memory_store import SharedMemoryStore
-
-    memory_cfg = config.get("memory", {})
-    memory_store = SharedMemoryStore(
-        db_path=memory_cfg.get("db_path", "data/memory.db"),
-        session_id=session_id,
-    )
-    modules["memory_store"] = memory_store
-    logger.info(f"[M4] Memory Store 模块已初始化 (session={session_id})")
+        evidence_store = EvidenceStore(evidence_cfg.get("db_path", "data/evidence.db"))
+        modules["evidence_store"] = evidence_store
+        logger.info("[Evidence] Claim-Evidence Store 已初始化")
 
     # Tools（真实工具或 Mock 工具）
     tools_list = _create_tools_factory(config)
     modules["tools"] = tools_list
     logger.info(f"Tools 模块已初始化（共 {len(tools_list)} 个工具）")
 
-    # M5: Red-Blue Adversarial Loop（先创建，再注入 Orchestrator）
-    from src.adversarial.loop import AdversarialLoop
-    from src.adversarial.red_agent import RedAgent
-    from src.adversarial.blue_agent import BlueAgent
-
-    red_policy = modules.get("red_agent_policy", default_policy)
-    blue_policy = modules.get("blue_agent_policy", default_policy)
-    adversarial_cfg = config.get("adversarial", {})
-
-    red_agent = RedAgent(
-        policy=red_policy,
-        max_tokens=getattr(red_policy, "max_tokens", 2048),
-    )
-    blue_agent = BlueAgent(
-        policy=blue_policy,
-        tools=tools_list,
-        max_tokens=getattr(blue_policy, "max_tokens", 4096),
-        max_issues=adversarial_cfg.get("max_issues_per_round"),
-    )
-    adversarial_loop = AdversarialLoop(
-        red_agent=red_agent,
-        blue_agent=blue_agent,
-        policy=modules.get("judge_policy", default_policy),
-        max_rounds=adversarial_cfg.get("max_rounds", 3),
-        score_threshold=adversarial_cfg.get("score_threshold", 8.0),
-        delta_threshold=adversarial_cfg.get("delta_threshold", 0.3),
-    )
-    modules["adversarial"] = adversarial_loop
-    logger.info("[M5] Adversarial 模块已初始化")
-
-    # M1: Multi-Agent Orchestrator
+    # Multi-Agent Orchestrator
     from src.orchestrator.orchestrator import Orchestrator
     from src.orchestrator.agent_pool import AgentPool
 
@@ -253,6 +227,11 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         policy_factory=lambda: modules.get("solver_policy", default_policy),
         tools_factory=lambda: list(modules["tools"]),
         max_idle=3,
+        agent_kwargs={
+            "max_tool_calls": int(config.get("research", {}).get("max_tool_calls", 6)),
+            "support_threshold": float(evidence_cfg.get("support_threshold", 0.22)),
+            "partial_threshold": float(evidence_cfg.get("partial_threshold", 0.08)),
+        },
     )
     modules["agent_pool"] = agent_pool
 
@@ -260,19 +239,12 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
         planner=planner,
         agent_pool=agent_pool,
         budget_tracker=budget_tracker,
-        compressor=compressor,
-        adversarial_loop=adversarial_loop,
-        memory_store=memory_store,
         summarizer_policy=modules.get("summarizer_policy", default_policy),
+        evidence_store=evidence_store,
+        evidence_pipeline=evidence_pipeline,
     )
     modules["orchestrator"] = orchestrator
-    logger.info("[M1] Orchestrator 模块已初始化")
-
-    # M6: Self-Evolution Engine（预留，默认禁用）
-    if config.get("evolution", {}).get("enabled", False):
-        logger.info("[M6] Evolution 模块已启用（预留接口）")
-    else:
-        logger.info("[M6] Evolution 模块已禁用")
+    logger.info("Orchestrator 模块已初始化")
 
     return modules
 
@@ -280,6 +252,38 @@ def initialize_modules(config: dict, session_id: str = "") -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 研究流程主函数
 # ---------------------------------------------------------------------------
+async def run_research_report(query: str, config: dict, modules: dict[str, Any]):
+    """Run the workflow and return the structured ResearchReport."""
+    logger = logging.getLogger("runner")
+    logger.info(f"开始研究，查询: {query[:80]}...")
+    orchestrator = modules["orchestrator"]
+    from src.orchestrator.schemas import RunConfig
+
+    research_cfg = config.get("research", {})
+    run_cfg = RunConfig(
+        max_concurrent=config.get("orchestrator", {}).get("max_concurrent", 5),
+        global_timeout_seconds=config.get("orchestrator", {}).get("global_timeout_seconds", 600),
+        max_replan_rounds=config.get("orchestrator", {}).get("max_replan_rounds", 3),
+        enable_iterative_research=research_cfg.get("enabled", True),
+        max_research_rounds=research_cfg.get("max_rounds", 2),
+        min_sources_per_task=research_cfg.get("min_sources_per_task", 2),
+        max_followup_tasks=research_cfg.get("max_followup_tasks", 3),
+    )
+
+    try:
+        report = await orchestrator.run(query, config=run_cfg)
+    finally:
+        from src.tools.web_search import WebSearchTool
+
+        await WebSearchTool.close_session()
+
+    logger.info(
+        f"[Orchestrator] 报告生成完成 | 置信度={report.confidence:.2f} | "
+        f"搜索轮数={report.num_searches} | 研究轮次={len(report.research_rounds)}"
+    )
+    return report
+
+
 async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str:
     """
     执行完整的研究流程。
@@ -288,10 +292,9 @@ async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str
         1. Orchestrator 调用 Planner 拆解问题为子任务 DAG
         2. Orchestrator 调度 AgentPool 中的子 Agent 并行/串行执行
         3. 子 Agent 调用 Tools 检索信息并生成子报告
-        4. Compressor 管理长上下文
-        5. Memory 存储中间结果
-        6. Adversarial Loop 对报告进行多轮对抗优化（若启用）
-        7. 输出最终研究报告
+        4. Evidence Pipeline 归一化来源并核验 claims
+        5. IterResearch 对来源不足的任务定向补搜
+        6. 输出最终研究报告和结构化证据
 
     Args:
         query: 用户输入的研究问题。
@@ -301,51 +304,18 @@ async def run_research(query: str, config: dict, modules: dict[str, Any]) -> str
     Returns:
         最终研究报告文本（Markdown 格式）。
     """
-    import asyncio
-
-    logger = logging.getLogger("runner")
-    logger.info(f"开始研究，查询: {query[:80]}...")
-
     start_time = time.time()
-
-    # Step 1-3: Orchestrator 内部完成规划、调度、收集、合成
-    orchestrator = modules["orchestrator"]
-    from src.orchestrator.schemas import RunConfig
-
-    run_cfg = RunConfig(
-        max_concurrent=config.get("orchestrator", {}).get("max_concurrent", 5),
-        global_timeout_seconds=config.get("orchestrator", {}).get("global_timeout_seconds", 600),
-        max_replan_rounds=config.get("orchestrator", {}).get("max_replan_rounds", 3),
-        max_sub_questions=config.get("orchestrator", {}).get("max_sub_questions", 8),
-        enable_adversarial=config.get("adversarial", {}).get("enabled", True),
-        enable_evolution=config.get("evolution", {}).get("enabled", False),
-    )
-
-    report = await orchestrator.run(query, config=run_cfg)
-    logger.info(
-        f"[Orchestrator] 报告生成完成 | 置信度={report.confidence:.2f} | "
-        f"搜索轮数={report.num_searches} | 重规划={report.num_replan} | 对抗轮数={report.adversarial_rounds}"
-    )
-
-    # Step 4/5: 进化优化（如启用且已训练）
-    if run_cfg.enable_evolution:
-        logger.info("[Evolution] 进化优化已启用（预留接口）")
-    else:
-        logger.info("[Evolution] 进化优化已跳过")
-
-    # 关闭 WebSearchTool 连接池
-    from src.tools.web_search import WebSearchTool
-    await WebSearchTool.close_session()
+    report = await run_research_report(query, config, modules)
 
     elapsed = time.time() - start_time
-    logger.info(f"研究完成，耗时: {elapsed:.2f} 秒")
+    logging.getLogger("runner").info(f"研究完成，耗时: {elapsed:.2f} 秒")
 
     # 组装最终输出
-    final_report = _format_report(report, elapsed)
+    final_report = format_report(report, elapsed)
     return final_report
 
 
-def _format_report(report, elapsed: float) -> str:
+def format_report(report, elapsed: float) -> str:
     """将 ResearchReport 格式化为 Markdown 文本。"""
     content = report.content or ""
 
@@ -371,7 +341,9 @@ def _format_report(report, elapsed: float) -> str:
         f"- **置信度**: {report.confidence:.2f}",
         f"- **搜索轮数**: {report.num_searches}",
         f"- **重规划次数**: {report.num_replan}",
-        f"- **对抗轮数**: {report.adversarial_rounds}",
+        f"- **迭代研究轮数**: {len(report.research_rounds)}",
+        f"- **引用蕴含率**: {report.evidence_metrics.get('citation_entailment', 0.0):.2%}",
+        f"- **无证据结论率**: {report.evidence_metrics.get('unsupported_claim_rate', 0.0):.2%}",
         f"- **总耗时**: {elapsed:.2f} 秒",
         "",
     ]
@@ -387,6 +359,36 @@ def _format_report(report, elapsed: float) -> str:
         lines.append("")
 
     return "\n".join(lines)
+
+
+# Backward-compatible alias for callers created before the public formatter.
+_format_report = format_report
+
+
+def serialize_report(report) -> dict[str, Any]:
+    """Convert a structured ResearchReport into JSON-compatible data."""
+    return {
+        "run_id": report.run_id,
+        "query": report.query,
+        "content": report.content,
+        "sources": report.sources,
+        "claims": report.claims,
+        "confidence": report.confidence,
+        "num_searches": report.num_searches,
+        "num_replan": report.num_replan,
+        "research_rounds": report.research_rounds,
+        "evidence_metrics": report.evidence_metrics,
+        "runtime_metrics": report.runtime_metrics,
+    }
+
+
+def save_structured_report(report, output_dir: str = "outputs/reports") -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    run_id = report.run_id or datetime.now().strftime("techresearch-%Y%m%d-%H%M%S")
+    filepath = os.path.join(output_dir, f"{run_id}.json")
+    with open(filepath, "w", encoding="utf-8") as handle:
+        json.dump(serialize_report(report), handle, ensure_ascii=False, indent=2)
+    return filepath
 
 
 # ---------------------------------------------------------------------------

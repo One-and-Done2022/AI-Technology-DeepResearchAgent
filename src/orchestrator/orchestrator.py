@@ -1,8 +1,8 @@
 """
-Deep Research Agent — 核心编排器 (M1: Multi-Agent Orchestrator)
+AI Technology Research Agent — 核心编排器
 
-9 状态状态机驱动的异步任务编排引擎：
-  IDLE → PLANNING → DISPATCHING → COLLECTING → SYNTHESIZING → ADVERSARIAL → DONE
+状态机驱动的异步任务编排引擎：
+  IDLE → PLANNING → DISPATCHING → COLLECTING → SYNTHESIZING → DONE
   失败时进入 REPLANNING，最终可进入 FAILED。
 
 设计亮点:
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from typing import Any, Callable
 
 from .schemas import (
@@ -31,10 +32,8 @@ from ..planner.dag import DAG
 from ..planner.planner import Planner, PlanParseError
 from ..planner.budget_tracker import BudgetTracker
 from ..utils.tracing import trace_chain
-
-# M4: Memory Store 类型提示（延迟导入避免循环依赖）
-SharedMemoryStore = Any
-
+from ..evidence.extractor import EvidencePipeline
+from ..research.workspace import ResearchWorkspace
 
 __all__ = ["Orchestrator"]
 
@@ -46,8 +45,7 @@ class Orchestrator:
         planner: 自适应规划器，负责初始规划和增量重规划。
         agent_pool: Agent 对象池，管理 worker agent 生命周期。
         budget_tracker: Token 预算追踪器。
-        memory_store: 全局共享内存，存储所有子任务结果和中间上下文。
-        compressor: （预留）上下文压缩器接口。
+        evidence_store: 持久化来源、claims 和评测指标。
     """
 
     def __init__(
@@ -55,22 +53,21 @@ class Orchestrator:
         planner: Planner,
         agent_pool: AgentPool,
         budget_tracker: BudgetTracker | None = None,
-        compressor: Any | None = None,
-        adversarial_loop: Any | None = None,
-        memory_store: Any | None = None,
         summarizer_policy: Any | None = None,
+        evidence_store: Any | None = None,
+        evidence_pipeline: EvidencePipeline | None = None,
     ) -> None:
         self.planner = planner
         self.agent_pool = agent_pool
         self.budget_tracker = budget_tracker or BudgetTracker()
-        self.compressor = compressor
-        self.adversarial_loop = adversarial_loop
-        self.memory_store = memory_store
         self.summarizer_policy = summarizer_policy
+        self.evidence_store = evidence_store
+        self.evidence_pipeline = evidence_pipeline or EvidencePipeline()
+        self.research_workspace = ResearchWorkspace()
 
-        # 运行时状态（保留 dict 作为快速缓存，M4 提供持久化 + 语义检索）
-        self._memory_store: dict[str, Any] = {}
+        self._runtime_state: dict[str, Any] = {}
         self._results: list[AgentResult] = []
+        self._all_results: list[AgentResult] = []
         self._dag: DAG | None = None
         self._task_map: dict[str, SubTask] = {}
         self._current_state = OrchestratorState.IDLE
@@ -78,7 +75,8 @@ class Orchestrator:
         self._config: RunConfig = RunConfig()
         self._start_time: float = 0.0
         self._replan_count: int = 0
-        self._adversarial_count: int = 0
+        self._research_round: int = 1
+        self._run_id: str = ""
 
         # 状态机处理器映射
         self._state_handlers: dict[OrchestratorState, Callable[[], asyncio.Future[OrchestratorState]]] = {
@@ -87,7 +85,6 @@ class Orchestrator:
             OrchestratorState.DISPATCHING: self._do_dispatching,
             OrchestratorState.COLLECTING: self._do_collecting,
             OrchestratorState.SYNTHESIZING: self._do_synthesizing,
-            OrchestratorState.ADVERSARIAL: self._do_adversarial,
             OrchestratorState.REPLANNING: self._do_replanning,
             OrchestratorState.DONE: self._on_done,
             OrchestratorState.FAILED: self._on_failed,
@@ -112,24 +109,25 @@ class Orchestrator:
         self._config = config or RunConfig()
         self._start_time = time.monotonic()
         self._replan_count = 0
-        self._adversarial_count = 0
-        self._memory_store.clear()
+        self._runtime_state.clear()
         self._results.clear()
+        self._all_results.clear()
         self._dag = None
         self._task_map.clear()
         self._current_state = OrchestratorState.IDLE
+        self._research_round = 1
+        self._run_id = f"techresearch-{uuid.uuid4().hex[:12]}"
+        self.research_workspace.reset()
 
         # 状态机主循环
         while self._current_state not in (OrchestratorState.DONE, OrchestratorState.FAILED):
             # 全局超时检查
             if self._is_global_timeout():
-                if self._current_state in (
-                    OrchestratorState.COLLECTING,
-                    OrchestratorState.SYNTHESIZING,
-                    OrchestratorState.ADVERSARIAL,
-                ):
-                    # 强制合成：用已有结果生成报告
-                    self._current_state = OrchestratorState.SYNTHESIZING
+                if self._all_results or self._results:
+                    self._runtime_state["final_report"] = self._build_partial_report(
+                        "global_timeout"
+                    )
+                    self._current_state = OrchestratorState.DONE
                 else:
                     self._current_state = OrchestratorState.FAILED
                 break
@@ -146,36 +144,41 @@ class Orchestrator:
         # 返回结果
         if self._current_state == OrchestratorState.DONE:
             # 最终报告应在 memory 中
-            report = self._memory_store.get("final_report")
+            report = self._runtime_state.get("final_report")
             if report is None:
                 report = ResearchReport(query=query, content="Report generation failed unexpectedly.")
             report.num_replan = self._replan_count
-            report.adversarial_rounds = self._adversarial_count
+            report.run_id = self._run_id
+            report.research_rounds = [item.to_dict() for item in self.research_workspace.rounds]
+            elapsed = time.monotonic() - self._start_time
+            report.runtime_metrics.update({
+                "elapsed_seconds": round(elapsed, 3),
+                "token_usage": sum(result.token_usage for result in self._all_results),
+                "tool_calls": sum(
+                    1
+                    for result in self._all_results
+                    for step in result.trajectory
+                    if step.get("role") == "tool"
+                ),
+                "subtask_count": len(self._all_results),
+                "subtask_success_count": sum(
+                    result.status == AgentStatus.SUCCESS for result in self._all_results
+                ),
+                "research_round_count": len(self.research_workspace.rounds),
+            })
 
-            # M4: 将最终报告存入 SharedMemoryStore
-            if self.memory_store is not None:
+            if self.evidence_store is not None:
                 try:
-                    from src.memory.long_term import MemoryEntry
-                    entry = MemoryEntry(
-                        entry_id=f"final_report:{int(time.time())}",
-                        claim=str(report.content)[:800],
-                        source="orchestrator",
-                        confidence=report.confidence,
-                        agent_id="orchestrator",
-                        timestamp=time.time(),
-                        evidence_type="primary",
-                        embedding=[],
-                        topic=query[:50],
-                        metadata={
-                            "num_searches": report.num_searches,
-                            "num_replan": report.num_replan,
-                            "adversarial_rounds": report.adversarial_rounds,
-                        },
+                    self.evidence_store.save_report(
+                        run_id=report.run_id,
+                        query=report.query,
+                        content=report.content,
+                        sources=report.sources,
+                        claims=report.claims,
+                        metrics={**report.evidence_metrics, **report.runtime_metrics},
                     )
-                    self.memory_store.put(entry)
-                    print(f"[M4] Final report stored to memory (confidence={report.confidence:.2f})")
                 except Exception as e:
-                    print(f"[M4] Failed to store final report: {e}")
+                    print(f"[EvidenceStore] Failed to persist report: {e}")
 
             return report
 
@@ -184,7 +187,6 @@ class Orchestrator:
             query=query,
             content="Research failed due to persistent errors or global timeout.",
             num_replan=self._replan_count,
-            adversarial_rounds=self._adversarial_count,
         )
 
     # ------------------------------------------------------------------
@@ -297,6 +299,10 @@ class Orchestrator:
                 else:
                     all_results.append(lr)
 
+            # 让下一执行层立即读取本层依赖结果；旧实现要到全部层结束后才写入。
+            for layer_result in all_results:
+                self._runtime_state[f"result:{layer_result.task_id}"] = layer_result
+
         self._results = all_results
         return OrchestratorState.COLLECTING
 
@@ -310,13 +316,9 @@ class Orchestrator:
         """
         # 将结果写入运行时 memory dict
         for r in self._results:
-            self._memory_store[f"result:{r.task_id}"] = r
+            self._runtime_state[f"result:{r.task_id}"] = r
 
-        # M4: 将成功结果同步写入 SharedMemoryStore（持久化 + 向量索引）
-        if self.memory_store is not None:
-            for r in self._results:
-                if r.status == AgentStatus.SUCCESS and r.output:
-                    self._sync_result_to_memory_store(r)
+        self._all_results.extend(self._results)
 
         success_count = sum(1 for r in self._results if r.status == AgentStatus.SUCCESS)
         total_count = len(self._results)
@@ -327,6 +329,33 @@ class Orchestrator:
             print(f" ({fail_count} 失败)")
         else:
             print()
+
+        # IterResearch：对失败或来源不足的任务发起有界定向核验轮次。
+        if self._config.enable_iterative_research:
+            may_continue = self._research_round < self._config.max_research_rounds
+            assessment = self.research_workspace.assess(
+                round_id=self._research_round,
+                results=self._results,
+                task_map=self._task_map,
+                min_sources_per_task=self._config.min_sources_per_task,
+                max_followup_tasks=self._config.max_followup_tasks,
+                may_continue=may_continue,
+            )
+            print(
+                f"[ResearchRound] round={self._research_round} sources={assessment.source_count} "
+                f"claims={assessment.claim_count} followups={len(assessment.followup_tasks)} "
+                f"stop={assessment.stop_reason or 'continue'}"
+            )
+            if assessment.should_continue:
+                next_dag = DAG()
+                for task in assessment.followup_tasks:
+                    next_dag.add_node(task.task_id)
+                self._dag = next_dag
+                self._task_map = {task.task_id: task for task in assessment.followup_tasks}
+                self._results = []
+                self._research_round += 1
+                self._runtime_state["research_workspace"] = self.research_workspace.compact_context()
+                return OrchestratorState.DISPATCHING
 
         # 检查是否需要重规划
         if self._should_replan(self._results):
@@ -339,35 +368,6 @@ class Orchestrator:
 
         return OrchestratorState.SYNTHESIZING
 
-    def _sync_result_to_memory_store(self, result: AgentResult) -> None:
-        """将 AgentResult 同步到 M4 SharedMemoryStore。
-
-        提取 output 中的关键 claim 作为记忆条目，支持后续语义检索。
-        """
-        try:
-            # 延迟导入避免循环依赖
-            from src.memory.long_term import MemoryEntry
-            claim_text = str(result.output)[:500]  # 取前 500 字作为 claim
-            entry = MemoryEntry(
-                entry_id=result.task_id,
-                claim=claim_text,
-                source=f"task:{result.task_id}",
-                confidence=getattr(result, "confidence", 0.5),
-                agent_id=result.task_id,
-                timestamp=time.time(),
-                evidence_type="primary",
-                embedding=[],  # SharedMemoryStore.put() 会自动生成 embedding
-                topic=self._query[:50],
-                metadata={
-                    "status": result.status.value,
-                    "token_usage": getattr(result, "token_usage", 0),
-                },
-            )
-            self.memory_store.put(entry)
-            print(f"[M4] Memory stored: {result.task_id} (claim={claim_text[:60]}...)")
-        except Exception as e:
-            print(f"[M4] Failed to store memory for {result.task_id}: {e}")
-
     async def _do_synthesizing(self) -> OrchestratorState:
         """调用 SummarizerAgent 合成研究报告。"""
         # 创建合成任务
@@ -378,19 +378,27 @@ class Orchestrator:
             timeout_seconds=300,
         )
 
+        synthesis_results = self._all_results or self._results
         context = {
             "query": self._query,
-            "results": self._results,
+            "results": synthesis_results,
+            "research_workspace": self.research_workspace.compact_context(),
         }
 
-        agent = await self.agent_pool.get_agent(TaskType.ANALYZE)
+        pooled_agent = await self.agent_pool.get_agent(TaskType.ANALYZE)
+        agent = pooled_agent
+        release_from_pool = True
         # 需要 SummarizerAgent，但 agent_pool 可能返回 ResearcherAgent
         # 这里我们通过类型检查或强制创建 SummarizerAgent
         from ..agents.summarizer import SummarizerAgent
         if not isinstance(agent, SummarizerAgent):
             # 优先使用配置的 summarizer_policy（更大的 max_tokens），fallback 到 agent.policy
             policy = self.summarizer_policy or agent.policy
-            agent = SummarizerAgent(name="summarizer", policy=policy, tools=agent.tools)
+            tools = agent.tools
+            await self.agent_pool.release_agent(pooled_agent)
+            release_from_pool = False
+            agent = SummarizerAgent(name="summarizer", policy=policy, tools=tools)
+            agent.evidence_pipeline = self.evidence_pipeline
 
         try:
             result = await asyncio.wait_for(
@@ -410,65 +418,28 @@ class Orchestrator:
                 output=f"Synthesis error: {type(e).__name__}: {e}",
             )
         finally:
-            await self.agent_pool.release_agent(agent)
+            if release_from_pool:
+                await self.agent_pool.release_agent(agent)
 
         if result.status == AgentStatus.SUCCESS and isinstance(result.output, ResearchReport):
-            self._memory_store["final_report"] = result.output
+            self._runtime_state["final_report"] = result.output
         else:
             # 合成失败但已有结果，生成降级报告
-            self._memory_store["final_report"] = ResearchReport(
+            self._runtime_state["final_report"] = ResearchReport(
                 query=self._query,
                 content=str(result.output) if result.output else "Synthesis failed.",
                 confidence=0.0,
                 num_searches=sum(
                     len([t for t in r.trajectory if t.get("role") == "tool"])
-                    for r in self._results
+                    for r in synthesis_results
                 ),
             )
 
-        if self._config.enable_adversarial:
-            print("[Synthesize] ✓ 报告合成完成，进入对抗优化")
-            return OrchestratorState.ADVERSARIAL
+        final_report = self._runtime_state.get("final_report")
+        if isinstance(final_report, ResearchReport):
+            final_report.research_rounds = [item.to_dict() for item in self.research_workspace.rounds]
+
         print("[Synthesize] ✓ 报告合成完成")
-        return OrchestratorState.DONE
-
-    async def _do_adversarial(self) -> OrchestratorState:
-        """M5: Red-Blue 对抗降噪循环。
-
-        调用 AdversarialLoop 对报告进行 challenge-verify 迭代优化。
-        仅在报告置信度低于阈值时触发，避免资源浪费。
-        """
-        report = self._memory_store.get("final_report")
-        if report is None:
-            return OrchestratorState.DONE
-
-        # 置信度足够高时跳过对抗
-        if report.confidence >= 0.8:
-            print("[Adversarial] ✓ 报告置信度已达标 (≥0.8)，跳过对抗优化")
-            return OrchestratorState.DONE
-
-        if self.adversarial_loop is None:
-            print("[Adversarial] AdversarialLoop 未配置，跳过")
-            return OrchestratorState.DONE
-
-        try:
-            print(f"[Adversarial] ▶ 启动 Red-Blue 对抗优化 (当前置信度={report.confidence:.2f})")
-            remaining = self._config.global_timeout_seconds - (time.monotonic() - self._start_time)
-            if remaining <= 0:
-                print("[Adversarial] 全局超时，保留对抗前报告")
-                return OrchestratorState.DONE
-            optimized_report, history = await asyncio.wait_for(
-                self.adversarial_loop.run(report),
-                timeout=remaining,
-            )
-            self._memory_store["final_report"] = optimized_report
-            self._adversarial_count += len(history)
-            print(f"[Adversarial] ✓ 对抗优化完成: {len(history)} 轮, 最终置信度={optimized_report.confidence:.2f}")
-        except asyncio.TimeoutError:
-            print("[Adversarial] 全局超时，保留对抗前报告")
-        except Exception as e:
-            print(f"[Adversarial] ✗ 对抗优化失败: {e}，使用原始报告")
-
         return OrchestratorState.DONE
 
     async def _do_replanning(self) -> OrchestratorState:
@@ -555,56 +526,24 @@ class Orchestrator:
         return elapsed > self._config.global_timeout_seconds
 
     def _build_memory_context(self) -> str:
-        """构建给 planner 的上下文摘要。
-
-        优先使用 M4 SharedMemoryStore 的语义检索（如果已接入），
-        否则回退到运行时 dict 遍历。
-        """
-        # M4: 语义检索相关记忆
-        if self.memory_store is not None:
-            try:
-                ctx = self.memory_store.get_context_for_query(
-                    self._query, max_tokens=2000
-                )
-                if ctx:
-                    print(f"[M4] Retrieved {len(ctx)} chars of semantic memory context")
-                    return ctx
-            except Exception as e:
-                print(f"[M4] Semantic memory query failed: {e}, falling back to dict")
-
-        # 回退：运行时 dict 遍历
+        """构建给 planner 的当前运行上下文摘要。"""
         parts = []
-        for key, value in self._memory_store.items():
+        for key, value in self._runtime_state.items():
             if key.startswith("result:"):
                 continue
             parts.append(f"{key}: {str(value)[:200]}")
-
-        # M3: 如果上下文过长，启用压缩
-        if self.compressor is not None and parts:
-            total_chars = sum(len(p) for p in parts)
-            if total_chars > 6000:  # 约 2000 tokens 的启发式阈值
-                try:
-                    compressed = self.compressor.compress(
-                        texts=parts,
-                        query=self._query,
-                        system_prompt_tokens=0,
-                    )
-                    print(f"[M3] Context compressed: {total_chars} → {sum(len(c) for c in compressed)} chars")
-                    return "\n".join(compressed)
-                except Exception as e:
-                    print(f"[M3] Compression failed: {e}, using raw context")
 
         return "\n".join(parts) if parts else ""
 
     def _build_task_context(self, subtask: SubTask) -> dict:
         """为单个 SubTask 构建执行上下文。"""
-        ctx = dict(self._memory_store)
+        ctx = dict(self._runtime_state)
         ctx["query"] = self._query
         # 注入依赖任务的结果
         for dep_id in subtask.dependencies:
             dep_key = f"result:{dep_id}"
-            if dep_key in self._memory_store:
-                ctx[f"dep:{dep_id}"] = self._memory_store[dep_key]
+            if dep_key in self._runtime_state:
+                ctx[f"dep:{dep_id}"] = self._runtime_state[dep_key]
         return ctx
 
     def _build_failure_reason(self, results: list[AgentResult]) -> str:
@@ -617,6 +556,40 @@ class Orchestrator:
         if failed_count > 0:
             reasons.append(f"{failed_count} tasks failed with errors")
         return "; ".join(reasons) if reasons else "Unknown failure"
+
+    def _build_partial_report(self, reason: str) -> ResearchReport:
+        """Build a transparent partial report without another model call."""
+        results = self._all_results or self._results
+        successful = [result for result in results if result.status == AgentStatus.SUCCESS]
+        lines = [
+            "## 部分研究结果",
+            "",
+            f"> 研究未完整结束：{reason}。以下内容未经最终综合，请结合来源人工复核。",
+            "",
+        ]
+        for result in successful:
+            lines.extend([f"### {result.task_id}", "", str(result.output), ""])
+
+        from ..agents.summarizer import SummarizerAgent
+
+        sources = SummarizerAgent._collect_sources(successful)
+        content = "\n".join(lines)
+        claims, metrics = self.evidence_pipeline.refresh(content, sources)
+        return ResearchReport(
+            query=self._query,
+            content=content,
+            sources=sources,
+            claims=claims,
+            evidence_metrics=metrics,
+            confidence=0.2 if successful else 0.0,
+            num_searches=sum(
+                1
+                for result in results
+                for step in result.trajectory
+                if step.get("role") == "tool"
+            ),
+            runtime_metrics={"partial": True, "termination_reason": reason},
+        )
 
     def _rebuild_task_map_from_dag(self) -> dict[str, SubTask]:
         """从 DAG 重建 task_map（当缺少原始 SubTask 信息时使用占位符）。
@@ -651,5 +624,7 @@ class Orchestrator:
                     priority=old.priority,
                     expected_type=old.expected_type,
                     search_hints=old.search_hints,
+                    source_requirements=old.source_requirements,
+                    verification_required=old.verification_required,
                 )
         return task_map
