@@ -58,7 +58,7 @@ Source
   published_at, retrieved_at, content_hash, quality_score
 
 Claim
-  claim_id, statement, citations, evidence,
+  claim_id, claim_type, statement, citations, evidence,
   verification_status, confidence
 
 VerificationStatus
@@ -131,6 +131,11 @@ cp .env.template .env.local
 
 项目目录和每个配置键的含义见 [`docs/PROJECT_STRUCTURE.md`](docs/PROJECT_STRUCTURE.md)。仓库只保留 `configs/default.yaml` 和 `configs/smoke.yaml` 两份 YAML。
 
+项目的执行路线、指标口径、简历数字填写规则和面试问答见
+[`docs/PROJECT_EXECUTION_AND_INTERVIEW_PLAYBOOK.md`](docs/PROJECT_EXECUTION_AND_INTERVIEW_PLAYBOOK.md)、
+[`docs/INTERVIEW_GUIDE.md`](docs/INTERVIEW_GUIDE.md) 和
+[`docs/STAR_AND_RESUME.md`](docs/STAR_AND_RESUME.md)。
+
 运行单条技术研究：
 
 ```bash
@@ -148,6 +153,11 @@ run_*.log                    # 可回放执行日志
 
 ## TechResearchBench-Mini
 
+完整的数据集来源、指标公式、实验数据和可信度边界见
+[`docs/EVALUATION.md`](docs/EVALUATION.md)。
+
+仓库同时提供历史兼容评测入口：`evaluation.benchmarks.ResearchBench`（35 题、11 个领域）和 `HotpotQABenchmark`（EM/F1/pass@1/实体覆盖率）；它们当前用于兼容性校验，正式主实验仍以 `TechResearchBench-Mini` 为主。
+
 当前领域集包含 30 道题，五类各 6 道：
 
 | 类别 | 数量 |
@@ -160,21 +170,39 @@ run_*.log                    # 可回放执行日志
 
 其中包含来源冲突、虚构技术核验和证据不足拒答任务。
 
-运行真实三系统对照：
+运行前先检查 Qwen、DeepSeek Judge 和搜索服务；三项必须全部通过：
+
+```bash
+.venv/bin/python scripts/preflight_overnight.py
+```
+
+运行四系统对照实验（30 题共 120 次生成）：
 
 ```bash
 .venv/bin/python scripts/run_tech_benchmark.py \
   --mode run \
-  --systems direct single_round evidence \
-  --limit 30
+  --systems direct_llm search_agent evidence_agent full_stack \
+  --config configs/benchmark.yaml \
+  --limit 30 \
+  --concurrency 2 \
+  --orchestrator-concurrency 1 \
+  --qwen-concurrency 2 \
+  --qwen-initial-concurrency 1 \
+  --qwen-rpm 60 \
+  --judge-concurrency 4
 ```
+
+结果每题即时写入指定的 `--output` JSONL，重复执行默认断点续跑；本轮正式结果写入
+`outputs/tech_benchmark_openalex_formal_current/results.jsonl`。
+`summary.json` 保存统计结果，`EVALUATION_REPORT.md` 保存结果核对表。`direct_llm`
+的证据指标为 `null`，不会与具备来源的系统混合计分。
 
 重新评分已有结果：
 
 ```bash
 .venv/bin/python scripts/run_tech_benchmark.py \
   --mode evaluate \
-  --input outputs/tech_benchmark/results.jsonl
+  --input outputs/tech_benchmark_openalex_formal_current/results.jsonl
 ```
 
 脚本输出按系统和类别聚合的指标，并对公共题目计算配对 Bootstrap 95% CI。
@@ -186,16 +214,33 @@ run_*.log                    # 可回放执行日志
 .venv/bin/python -m compileall -q src evaluation scripts tests
 ```
 
-当前离线验证结果：
+当前验证结果：
 
 ```text
-15 passed
+70 passed
 compileall passed
-targeted mypy passed (10 new evidence/research/evaluation files)
+Qwen2.5-7B and DeepSeek-V4-Flash API preflight passed
+30 questions × 4 systems = 120 formal records
+119/120 generation records completed successfully
 GitHub Reader live smoke passed (metadata, README, license, latest release)
 ```
 
-`evaluation/fixtures/tech_benchmark_smoke.jsonl` 只验证评分和统计脚本，不能作为真实模型效果或简历指标。由于仓库环境未配置真实 API Key/本地 vLLM 服务，联网的 30 题对照结果需要在配置模型和搜索服务后运行。
+当前正式结果使用 OpenAlex 搜索后端，不能表述为 Bocha 搜索结果。`direct_llm` 的证据指标为
+`null`，表示不适用；固定轨迹回放显示 Evidence 核验和压缩器的作用，但当前版本尚未证明
+多 Agent 能稳定提升 7B 模型的最终 Judge 内容分。
+
+正式结果目录：
+
+```text
+outputs/tech_benchmark_openalex_formal_current/
+├── results.jsonl
+├── summary.json
+├── EVALUATION_REPORT.md
+├── replay_summary.json
+└── comparison/
+```
+
+`evaluation/fixtures/tech_benchmark_smoke.jsonl` 只验证评分和统计脚本，不能作为真实模型效果或简历指标。
 
 ## 目录
 

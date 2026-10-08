@@ -9,6 +9,7 @@
   - bing:    微软搜索 API，国内稳定，需 Azure 订阅 Key
   - bocha:   博查AI搜索，国内索引最全，面向 AI Agent 优化
   - metaso:  秘塔AI搜索，中文语义强，有 research 多轮模式
+  - openalex: OpenAlex 免费论文检索，无需 API Key
 """
 from __future__ import annotations
 
@@ -16,6 +17,8 @@ import asyncio
 import json
 import os
 import random
+import re
+import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -143,6 +146,14 @@ class WebSearchTool(BaseWebSearchTool):
     """
 
     _session: aiohttp.ClientSession | None = None
+    _ARXIV_STOPWORDS = {
+        "a", "an", "and", "are", "based", "compare", "comparing", "comparison",
+        "describe", "detailed", "documentation", "explain", "find", "for", "from",
+        "full", "how", "in", "into", "main", "model", "official", "paper", "papers",
+        "research", "search", "show", "study", "the", "their", "this", "to", "using",
+        "what", "with", "work", "works", "analysis", "analyze", "identify", "verify",
+        "evidence", "implementation", "repositories", "repository", "application", "applications",
+    }
 
     def __init__(self, backend: str | None = None, api_key: str | None = None, api_endpoint: str | None = None) -> None:
         self.backend = (backend or get_env("SEARCH_BACKEND", "serpapi")).lower().strip()
@@ -162,6 +173,10 @@ class WebSearchTool(BaseWebSearchTool):
         # 秘塔AI 配置
         self.metaso_key = api_key or get_env("METASO_API_KEY")
         self.metaso_endpoint = api_endpoint or get_env("METASO_API_ENDPOINT", "https://metaso.cn/api/open/search/v2")
+
+        # OpenAlex 配置（无需 API Key）
+        self.openalex_email = get_env("OPENALEX_EMAIL")
+        self.openalex_endpoint = api_endpoint or get_env("OPENALEX_ENDPOINT", "https://api.openalex.org/works")
 
     def _get_session(self) -> aiohttp.ClientSession:
         """获取复用的 ClientSession，避免每次搜索新建连接。"""
@@ -195,7 +210,157 @@ class WebSearchTool(BaseWebSearchTool):
             return await self._bocha_execute(query, top_n)
         if self.backend == "metaso":
             return await self._metaso_execute(query, top_n)
+        if self.backend == "openalex":
+            return await self._openalex_execute(query, top_n)
         return await self._serpapi_execute(query, top_n)
+
+    async def _openalex_execute(self, query: str, top_n: int) -> dict[str, Any]:
+        """Use OpenAlex, with a public arXiv fallback when its shared quota is exhausted."""
+        params: dict[str, Any] = {"search": query, "per-page": min(max(int(top_n), 1), 25)}
+        if self.openalex_email:
+            params["mailto"] = self.openalex_email
+        openalex_error = ""
+        try:
+            session = self._get_session()
+            async with session.get(
+                self.openalex_endpoint,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                data = await resp.json()
+                if resp.status == 200:
+                    results: list[dict[str, Any]] = []
+                    for item in data.get("results", [])[:top_n]:
+                        location = item.get("primary_location") or {}
+                        source = location.get("source") or {}
+                        abstract = item.get("abstract_inverted_index") or {}
+                        ordered = sorted(
+                            ((position, word) for word, positions in abstract.items() for position in positions),
+                            key=lambda pair: pair[0],
+                        )
+                        abstract_text = " ".join(word for _, word in ordered)
+                        results.append({
+                            "title": item.get("title", ""),
+                            "url": location.get("landing_page_url") or item.get("doi", ""),
+                            "snippet": abstract_text[:1000] or str(item.get("publication_year", "")),
+                            "published_at": item.get("publication_date", ""),
+                            "source": "openalex",
+                            "source_type": "paper",
+                            "publisher": source.get("display_name", ""),
+                        })
+                    return {"query": query, "results": results, "total": len(results), "source": "openalex"}
+                openalex_error = f"OpenAlex API error: {data.get('message', resp.status)}"
+        except Exception as exc:
+            openalex_error = f"OpenAlex network error: {exc}"
+
+        fallback = await self._arxiv_fallback_execute(query, top_n)
+        if fallback.get("results"):
+            fallback["fallback_from"] = "openalex"
+            fallback["warning"] = openalex_error
+            return fallback
+        return {"query": query, "results": [], "total": 0, "error": openalex_error}
+
+    async def _arxiv_fallback_execute(self, query: str, top_n: int) -> dict[str, Any]:
+        """Query the public arXiv Atom API without requiring an API key."""
+        words = re.findall(r"[A-Za-z0-9][A-Za-z0-9+\-]{1,}", query)
+        # Research queries often contain terms such as "official" or "paper"
+        # that are not present in the paper metadata.  Try a strict query first,
+        # then progressively relax it so a provider quota failure does not look
+        # like a genuine no-result search.
+        filtered_words = [
+            word for word in words
+            if len(word) > 2 and word.lower() not in self._ARXIV_STOPWORDS
+        ]
+        # Acronyms, hyphenated names and version-like tokens are usually the
+        # actual research entities (e.g. QLoRA, MoE, mixture-of-experts), while
+        # generic verbs are not.  Search entity terms first to avoid returning
+        # unrelated recent papers merely because they contain "paper" or
+        # "research" in metadata.
+        entity_words = sorted(
+            filtered_words,
+            key=lambda word: (
+                not (any(char.isupper() for char in word) or "-" in word or any(char.isdigit() for char in word)),
+                -len(word),
+            ),
+        )
+        normalized_words = list(dict.fromkeys(word.lower() for word in entity_words))
+        # Preserve the first occurrence while removing repeated query terms.
+        normalized_words = list(dict.fromkeys(normalized_words))
+        candidates: list[str] = []
+        if normalized_words:
+            candidates.extend(f"all:{word}" for word in normalized_words[:3])
+            if len(normalized_words) >= 2:
+                candidates.append("all:" + "+AND+all:".join(normalized_words[:2]))
+        else:
+            # Do not inject an unrelated default topic for Chinese-only or
+            # malformed queries.  Returning no result is safer than silently
+            # contaminating a research trace with Transformer papers.
+            return {
+                "query": query,
+                "results": [],
+                "total": 0,
+                "source": "arxiv_fallback",
+                "error": "arXiv fallback requires at least one Latin search term",
+            }
+        candidates = list(dict.fromkeys(candidates))
+        namespace = {"atom": "http://www.w3.org/2005/Atom"}
+        last_error = ""
+        try:
+            session = self._get_session()
+            root = None
+            selected_query = candidates[-1]
+            for search_query in candidates:
+                params = {
+                    "search_query": search_query,
+                    "start": 0,
+                    "max_results": min(max(int(top_n), 1), 10),
+                }
+                async with session.get(
+                    "https://export.arxiv.org/api/query",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status != 200:
+                        last_error = f"arXiv fallback API error: {resp.status}"
+                        continue
+                    parsed = ET.fromstring(await resp.text())
+                    entries = parsed.findall("atom:entry", namespace)
+                    if entries:
+                        root = parsed
+                        selected_query = search_query
+                        break
+                    last_error = "arXiv fallback returned no entries"
+            if root is None:
+                return {"query": query, "results": [], "total": 0,
+                        "source": "arxiv_fallback", "error": last_error}
+        except Exception as exc:
+            return {"query": query, "results": [], "total": 0,
+                    "error": f"arXiv fallback network error: {exc}"}
+
+        results: list[dict[str, Any]] = []
+        for entry in root.findall("atom:entry", namespace)[:top_n]:
+            title = " ".join((entry.findtext("atom:title", "", namespace) or "").split())
+            summary = " ".join((entry.findtext("atom:summary", "", namespace) or "").split())
+            url = entry.findtext("atom:id", "", namespace) or ""
+            if url.startswith("http://arxiv.org/"):
+                url = "https://arxiv.org/" + url.split("http://arxiv.org/", 1)[1]
+            published = entry.findtext("atom:published", "", namespace) or ""
+            results.append({
+                "title": title,
+                "url": url,
+                "snippet": summary[:1000],
+                "published_at": published[:10],
+                "source": "arxiv_fallback",
+                "source_type": "paper",
+                "publisher": "arXiv",
+            })
+        return {
+            "query": query,
+            "results": results,
+            "total": len(results),
+            "source": "arxiv_fallback",
+            "search_query_used": selected_query,
+        }
 
     async def _serpapi_execute(self, query: str, top_n: int) -> dict[str, Any]:
         if not self.serpapi_key:

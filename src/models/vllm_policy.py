@@ -10,13 +10,109 @@ VLLM Policy — OpenAI API 封装
 from __future__ import annotations
 
 import json
+import random
 import re
+import threading
+import time
+from collections import deque
 from typing import Optional
 
 from openai import OpenAI
 
+from ..utils.env_config import get_env_float
 
-__all__ = ["VLLMPolicy", "OpenAICompatibleDict"]
+
+__all__ = ["VLLMPolicy", "OpenAICompatibleDict", "configure_global_request_limiter"]
+
+
+class _GlobalRequestLimiter:
+    """Thread-safe process-wide concurrency and rolling-RPM limiter."""
+
+    def __init__(self) -> None:
+        self.maximum = 12
+        self.limit = 12
+        self.rpm = 600
+        self.active = 0
+        self.requests: deque[float] = deque()
+        self.last_429: float | None = None
+        self.cooldown_until = 0.0
+        self.condition = threading.Condition()
+
+    def configure(self, concurrency: int, rpm: int, initial_concurrency: int | None = None) -> None:
+        with self.condition:
+            self.maximum = max(1, concurrency)
+            self.limit = min(self.maximum, max(1, initial_concurrency or self.maximum))
+            self.rpm = max(1, rpm)
+            self.active = 0
+            self.requests.clear()
+            self.last_429 = None
+            self.cooldown_until = 0.0
+            self.condition.notify_all()
+
+    def acquire(self) -> None:
+        with self.condition:
+            while True:
+                now = time.monotonic()
+                if now < self.cooldown_until:
+                    self.condition.wait(timeout=min(1.0, self.cooldown_until - now))
+                    continue
+                while self.requests and now - self.requests[0] >= 60:
+                    self.requests.popleft()
+                if self.last_429 is not None and now - self.last_429 >= 300 and self.limit < self.maximum:
+                    self.limit = min(self.maximum, self.limit * 2)
+                    self.last_429 = now if self.limit < self.maximum else None
+                    print(f"[QwenLimiter] recovered concurrency to {self.limit}")
+                if self.active < self.limit and len(self.requests) < self.rpm:
+                    self.active += 1
+                    self.requests.append(now)
+                    return
+                wait_for = 1.0
+                if len(self.requests) >= self.rpm:
+                    wait_for = max(0.05, 60 - (now - self.requests[0]))
+                self.condition.wait(timeout=min(wait_for, 1.0))
+
+    def release(self) -> None:
+        with self.condition:
+            self.active = max(0, self.active - 1)
+            self.condition.notify_all()
+
+    def on_429(self, retry_after: float | None = None) -> None:
+        with self.condition:
+            self.limit = max(1, self.limit // 2)
+            now = time.monotonic()
+            self.last_429 = now
+            cooldown = max(15.0, retry_after or 0.0)
+            self.cooldown_until = max(self.cooldown_until, now + cooldown)
+            print(
+                f"[QwenLimiter] 429 detected; concurrency reduced to {self.limit}; "
+                f"global cooldown {cooldown:.1f}s"
+            )
+            self.condition.notify_all()
+
+    def snapshot(self) -> dict[str, int]:
+        with self.condition:
+            return {"limit": self.limit, "maximum": self.maximum, "rpm": self.rpm, "active": self.active}
+
+
+_GLOBAL_REQUEST_LIMITER = _GlobalRequestLimiter()
+
+
+def configure_global_request_limiter(
+    concurrency: int = 12, rpm: int = 600, initial_concurrency: int | None = None
+) -> None:
+    _GLOBAL_REQUEST_LIMITER.configure(concurrency, rpm, initial_concurrency)
+
+
+def _retry_after_seconds(error: Exception) -> float | None:
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    value = headers.get("retry-after") or headers.get("Retry-After")
+    try:
+        return max(0.0, float(value)) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 # 正则表达式：用于抠出 Qwen 在标签外输出废话时的工具指令
@@ -53,8 +149,15 @@ class VLLMPolicy:
         top_p: float = 1.0,
         max_tokens: int = 1024,
         tools: Optional[list[dict]] = None,
+        max_retries: int = 2,
+        strict_errors: bool = False,
+        timeout: float | None = None,
     ):
-        raw_client = OpenAI(base_url=base_url, api_key=api_key)
+        raw_client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout or get_env_float("QWEN_REQUEST_TIMEOUT", 60.0),
+        )
         # 如果 LangSmith 追踪开启，自动包装 client 以追踪所有 LLM 调用
         from ..utils.tracing import maybe_wrap_openai_client
         self.client = maybe_wrap_openai_client(raw_client)
@@ -63,8 +166,16 @@ class VLLMPolicy:
         self.top_p = top_p
         self.max_tokens = max_tokens
         self.tools = tools
+        self.max_retries = max(0, max_retries)
+        self.strict_errors = strict_errors
         # [污染标记] 一旦发生过主动截断，整条 trajectory 作废
         self.was_truncated = False
+        self.usage_totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "usage_estimated": False,
+        }
 
     def set_tools(self, tools: list[dict]) -> None:
         """注册可用工具（OpenAI function calling schema）。"""
@@ -204,7 +315,26 @@ class VLLMPolicy:
             kwargs["tool_choice"] = "auto"
 
         try:
-            resp = self.client.chat.completions.create(**kwargs)
+            resp = None
+            for attempt in range(self.max_retries + 1):
+                _GLOBAL_REQUEST_LIMITER.acquire()
+                try:
+                    resp = self.client.chat.completions.create(**kwargs)
+                    break
+                except Exception as request_error:
+                    status = getattr(request_error, "status_code", None)
+                    retryable = status in {429, 500, 502, 503, 504} or "timeout" in str(request_error).lower()
+                    retry_after = _retry_after_seconds(request_error)
+                    if status == 429:
+                        _GLOBAL_REQUEST_LIMITER.on_429(retry_after)
+                    if attempt >= self.max_retries or not retryable:
+                        raise
+                    delay = retry_after if retry_after is not None else (5, 15)[attempt]
+                    time.sleep(delay + random.uniform(0, min(1.0, delay * 0.1)))
+                finally:
+                    _GLOBAL_REQUEST_LIMITER.release()
+            if resp is None:
+                raise RuntimeError("Model request returned no response")
             raw_msg = resp.choices[0].message
             content = raw_msg.content or ""
 
@@ -236,7 +366,27 @@ class VLLMPolicy:
                         continue
 
             # 6. 返回万能对象
-            result = OpenAICompatibleDict(role="assistant", content=content, tool_calls=final_tool_calls)
+            raw_usage = getattr(resp, "usage", None)
+            if raw_usage is not None:
+                usage = {
+                    "input_tokens": int(getattr(raw_usage, "prompt_tokens", 0) or 0),
+                    "output_tokens": int(getattr(raw_usage, "completion_tokens", 0) or 0),
+                    "total_tokens": int(getattr(raw_usage, "total_tokens", 0) or 0),
+                    "usage_estimated": False,
+                }
+            else:
+                input_estimate = len(json.dumps(sanitized, ensure_ascii=False)) // 3
+                output_estimate = len(content) // 3
+                usage = {
+                    "input_tokens": input_estimate,
+                    "output_tokens": output_estimate,
+                    "total_tokens": input_estimate + output_estimate,
+                    "usage_estimated": True,
+                }
+            for key in ("input_tokens", "output_tokens", "total_tokens"):
+                self.usage_totals[key] += usage[key]
+            self.usage_totals["usage_estimated"] = self.usage_totals["usage_estimated"] or usage["usage_estimated"]
+            result = OpenAICompatibleDict(role="assistant", content=content, tool_calls=final_tool_calls, usage=usage)
             if getattr(raw_msg, "reasoning_content", None):
                 result["reasoning_content"] = raw_msg.reasoning_content
             return result
@@ -253,6 +403,9 @@ class VLLMPolicy:
                 raise RuntimeError(
                     f"[CONTEXT_LENGTH_EXCEEDED] n_msgs={n_msgs}, est_chars={total_chars}: {err_str}"
                 ) from e
+
+            if self.strict_errors:
+                raise RuntimeError(f"[MODEL_REQUEST_FAILED] {err_str}") from e
 
             # 其他错误（网络抖动、vLLM 临时 busy 等）：返回假 assistant，让 trajectory 有机会继续
             return OpenAICompatibleDict(

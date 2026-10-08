@@ -2,7 +2,7 @@
 AI Technology Research Agent — 核心编排器
 
 状态机驱动的异步任务编排引擎：
-  IDLE → PLANNING → DISPATCHING → COLLECTING → SYNTHESIZING → DONE
+  IDLE → PLANNING → DISPATCHING → COLLECTING → SYNTHESIZING → FINALIZING → DONE
   失败时进入 REPLANNING，最终可进入 FAILED。
 
 设计亮点:
@@ -56,6 +56,9 @@ class Orchestrator:
         summarizer_policy: Any | None = None,
         evidence_store: Any | None = None,
         evidence_pipeline: EvidencePipeline | None = None,
+        red_blue_auditor: Any | None = None,
+        context_compressor: Any | None = None,
+        shared_memory: Any | None = None,
     ) -> None:
         self.planner = planner
         self.agent_pool = agent_pool
@@ -63,6 +66,9 @@ class Orchestrator:
         self.summarizer_policy = summarizer_policy
         self.evidence_store = evidence_store
         self.evidence_pipeline = evidence_pipeline or EvidencePipeline()
+        self.red_blue_auditor = red_blue_auditor
+        self.context_compressor = context_compressor
+        self.shared_memory = shared_memory
         self.research_workspace = ResearchWorkspace()
 
         self._runtime_state: dict[str, Any] = {}
@@ -85,6 +91,7 @@ class Orchestrator:
             OrchestratorState.DISPATCHING: self._do_dispatching,
             OrchestratorState.COLLECTING: self._do_collecting,
             OrchestratorState.SYNTHESIZING: self._do_synthesizing,
+            OrchestratorState.FINALIZING: self._do_finalizing,
             OrchestratorState.REPLANNING: self._do_replanning,
             OrchestratorState.DONE: self._on_done,
             OrchestratorState.FAILED: self._on_failed,
@@ -166,6 +173,7 @@ class Orchestrator:
                 ),
                 "research_round_count": len(self.research_workspace.rounds),
             })
+            report.verification_applicability = self.evidence_pipeline.verify
 
             if self.evidence_store is not None:
                 try:
@@ -204,7 +212,11 @@ class Orchestrator:
         """
         try:
             memory_ctx = self._build_memory_context()
-            self._dag = self.planner.generate_plan(self._query, memory_ctx)
+            self._dag = self.planner.generate_plan(
+                self._query,
+                memory_ctx,
+                max_tasks=self._config.max_plan_tasks,
+            )
             # 从 planner 获取完整的 SubTask 信息（包括 description、search_hints 等）
             self._task_map = self.planner.get_task_map_from_dag(self._dag, self.planner._last_raw_json)
             if not self._task_map:
@@ -288,13 +300,13 @@ class Orchestrator:
             layer_results = await asyncio.gather(*coros, return_exceptions=True)
 
             for lr in layer_results:
-                if isinstance(lr, Exception):
+                if isinstance(lr, BaseException):
                     # 将异常包装为 FAILED 结果
                     # 这种情况理论上不会发生（_run_one 内部已捕获），但保险起见
                     all_results.append(AgentResult(
                         task_id="unknown",
                         status=AgentStatus.FAILED,
-                        output=f"Dispatch exception: {lr}",
+                        output=f"Dispatch exception: {type(lr).__name__}: {lr}",
                     ))
                 else:
                     all_results.append(lr)
@@ -385,6 +397,22 @@ class Orchestrator:
             "research_workspace": self.research_workspace.compact_context(),
         }
 
+        if self.shared_memory is not None and self._config.enable_shared_memory:
+            all_sources = [source for result in synthesis_results for source in result.sources]
+            memory_metrics = self.shared_memory.add_sources(all_sources)
+            self._runtime_state["memory_metrics"] = memory_metrics
+            context["memory_context"] = self.shared_memory.search(self._query, top_k=5)
+
+        if self.context_compressor is not None and self._config.enable_context_compression:
+            raw_context = "\n".join(str(result.output) for result in synthesis_results)
+            compression = self.context_compressor.compress(
+                raw_context,
+                claims=[claim for result in synthesis_results for claim in result.claims],
+                max_chars=max(800, int(len(raw_context) * self._config.compression_target_ratio)),
+            )
+            self._runtime_state["compression_metrics"] = compression.metrics()
+            context["compressed_context"] = compression.text
+
         pooled_agent = await self.agent_pool.get_agent(TaskType.ANALYZE)
         agent = pooled_agent
         release_from_pool = True
@@ -438,8 +466,58 @@ class Orchestrator:
         final_report = self._runtime_state.get("final_report")
         if isinstance(final_report, ResearchReport):
             final_report.research_rounds = [item.to_dict() for item in self.research_workspace.rounds]
+            if self.red_blue_auditor is not None and self._config.enable_adversarial_audit:
+                audit_kwargs = {
+                    "content": final_report.content,
+                    "claims": final_report.claims,
+                    "enabled": True,
+                }
+                if getattr(self.red_blue_auditor, "requires_context", False):
+                    audit_kwargs.update({
+                        "query": self._query,
+                        "sources": final_report.sources,
+                    })
+                audit = self.red_blue_auditor.audit(**audit_kwargs)
+                final_report.content = audit.content
+                final_report.claims = audit.claims
+                final_report.runtime_metrics.update(audit.metrics())
+                final_report.runtime_metrics["audit_events"] = [
+                    issue.to_dict() for issue in audit.issues
+                ]
+            final_report.runtime_metrics.update(self._runtime_state.get("memory_metrics", {}))
+            final_report.runtime_metrics.update(self._runtime_state.get("compression_metrics", {}))
 
         print("[Synthesize] ✓ 报告合成完成")
+        return OrchestratorState.FINALIZING
+
+    async def _do_finalizing(self) -> OrchestratorState:
+        """在报告进入终态前统一完成交付收口。"""
+        report = self._runtime_state.get("final_report")
+        if not isinstance(report, ResearchReport):
+            report = ResearchReport(
+                query=self._query,
+                content="Synthesis failed before finalization.",
+                confidence=0.0,
+            )
+            self._runtime_state["final_report"] = report
+
+        # 该状态不是空转：它保证所有正常完成的报告都有明确的
+        # termination_reason 和证据适用性，便于 benchmark 回放与审计。
+        report.runtime_metrics["finalization_state"] = "finalizing"
+        report.runtime_metrics.setdefault("termination_reason", "completed")
+        report.verification_applicability = bool(self.evidence_pipeline.verify)
+        if report.sources:
+            # Quality-control modules may modify report text and claims after
+            # synthesis. Re-run the shared post-processing contract so
+            # search/evidence/full_stack remain comparable.
+            claims, evidence_metrics = self.evidence_pipeline.refresh(
+                report.content, report.sources
+            )
+            report.claims = claims
+            report.content = self.evidence_pipeline.annotate_citations(
+                report.content, claims
+            )
+            report.evidence_metrics = evidence_metrics
         return OrchestratorState.DONE
 
     async def _do_replanning(self) -> OrchestratorState:
@@ -575,6 +653,7 @@ class Orchestrator:
         sources = SummarizerAgent._collect_sources(successful)
         content = "\n".join(lines)
         claims, metrics = self.evidence_pipeline.refresh(content, sources)
+        content = self.evidence_pipeline.annotate_citations(content, claims)
         return ResearchReport(
             query=self._query,
             content=content,
@@ -589,6 +668,7 @@ class Orchestrator:
                 if step.get("role") == "tool"
             ),
             runtime_metrics={"partial": True, "termination_reason": reason},
+            verification_applicability=self.evidence_pipeline.verify,
         )
 
     def _rebuild_task_map_from_dag(self) -> dict[str, SubTask]:

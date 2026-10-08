@@ -1,0 +1,58 @@
+# Reproducible external-API benchmark profile.
+# API keys and SEARCH_BACKEND remain in .env.local.
+
+model:
+  backend: "qwen"
+  backend_sampling:
+    qwen:
+      temperature: 0.2
+      max_tokens: 2048
+      top_p: 1.0
+    modules:
+      planner:
+        temperature: 0.1
+        max_tokens: 1536
+      solver:
+        temperature: 0.2
+        max_tokens: 2048
+      summarizer:
+        temperature: 0.2
+        max_tokens: 4096
+  backend_mapping:
+    planner: "qwen"
+    solver: "qwen"
+    summarizer: "qwen"
+
+orchestrator:
+  max_concurrent: 1
+  global_timeout_seconds: 420
+  max_replan_rounds: 1
+  max_plan_tasks: 4
+
+research:
+  enabled: true
+  max_rounds: 2
+  min_sources_per_task: 1
+  max_followup_tasks: 2
+  max_tool_calls: 4
+
+evidence:
+  enabled: true
+  verification_enabled: true
+  db_path: "outputs/benchmark/evidence.db"
+  support_threshold: 0.22
+  partial_threshold: 0.08
+
+quality_control:
+  adversarial_enabled: true
+  adversarial_backend: deterministic
+  expose_audit: false
+  adversarial_max_tokens: 2048
+  compression_enabled: true
+  memory_enabled: true
+  compression_target_ratio: 0.65
+  max_adversarial_rounds: 2
+
+tools:
+  mock_mode: false
+  github_timeout_seconds: 15

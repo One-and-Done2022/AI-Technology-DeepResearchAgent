@@ -45,6 +45,7 @@ class ModelRouter:
     @staticmethod
     def create_backend(
         backend_name: str | None = None,
+        fresh_instance: bool = False,
         **override_kwargs,
     ) -> VLLMPolicy:
         """创建指定名称的 LLM Backend（返回 VLLMPolicy 实例）。
@@ -66,7 +67,7 @@ class ModelRouter:
 
         # 检查缓存
         cache_key = f"{name}:{hash(tuple(sorted(override_kwargs.items())))}"
-        if cache_key in _BACKEND_CACHE:
+        if not fresh_instance and cache_key in _BACKEND_CACHE:
             return _BACKEND_CACHE[cache_key]
 
         # 根据名称读取 .env 配置
@@ -75,7 +76,8 @@ class ModelRouter:
 
         # 创建 VLLMPolicy 实例
         policy = VLLMPolicy(**config)
-        _BACKEND_CACHE[cache_key] = policy
+        if not fresh_instance:
+            _BACKEND_CACHE[cache_key] = policy
         return policy
 
     @staticmethod

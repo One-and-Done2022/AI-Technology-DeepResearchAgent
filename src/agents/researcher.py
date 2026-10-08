@@ -51,6 +51,7 @@ class ResearcherAgent(BaseAgent):
         max_tool_calls: int = 6,
         support_threshold: float = 0.22,
         partial_threshold: float = 0.08,
+        verify_evidence: bool = True,
     ) -> None:
         super().__init__(name, policy, tools)
         self.max_turns = max_turns
@@ -60,7 +61,8 @@ class ResearcherAgent(BaseAgent):
             EvidenceVerifier(
                 support_threshold=support_threshold,
                 partial_threshold=partial_threshold,
-            )
+            ),
+            verify=verify_evidence,
         )
 
     @trace_agent(name="researcher.run", tags=["agent", "researcher"])
@@ -92,7 +94,7 @@ class ResearcherAgent(BaseAgent):
                     task_id=task.task_id,
                     content=content,
                     trajectory=[{"role": "assistant", "content": content}],
-                    token_usage=len(content) // 3,
+                    token_usage=int(response.get("usage", {}).get("total_tokens", len(content) // 3)),
                 )
             except Exception as e:
                 return AgentResult(
@@ -162,8 +164,8 @@ class ResearcherAgent(BaseAgent):
                 "tool_calls": [dict(tc) for tc in tool_calls],
             })
 
-            # 估算 token（简化：字符数 / 3）
-            total_tokens += len(json.dumps(messages, ensure_ascii=False)) // 3
+            usage = response.get("usage", {})
+            total_tokens += int(usage.get("total_tokens", len(json.dumps(messages, ensure_ascii=False)) // 3))
 
             # 无工具调用 → 任务完成
             if not tool_calls:
@@ -195,6 +197,39 @@ class ResearcherAgent(BaseAgent):
                     args = {}
 
                 result = await self._execute_tool(tool_name, args)
+
+                # Academic APIs can rate-limit independently. Fall back to the configured
+                # web search backend instead of returning a source-empty research result.
+                if tool_name == "arxiv_reader" and isinstance(result, dict) and (
+                    result.get("error") or not result.get("papers")
+                ) and "web_search" in self.tool_map:
+                    if result.get("error"):
+                        trajectory.append({
+                            "turn": turn,
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", ""),
+                            "name": "arxiv_reader",
+                            "arguments": args,
+                            "error": result.get("error"),
+                            "result": result,
+                        })
+                    fallback_query = str(
+                        args.get("query") or args.get("search_query") or task.description
+                    )
+                    web_result = await self._execute_tool(
+                        "web_search", {"query": fallback_query, "top_n": 5}
+                    )
+                    trajectory.append({
+                        "turn": turn,
+                        "role": "tool",
+                        "tool_call_id": f"{tc.get('id', '')}_fallback",
+                        "name": "web_search",
+                        "arguments": {"query": fallback_query, "top_n": 5},
+                        "result": web_result,
+                        "fallback_from": "arxiv_reader",
+                    })
+                    if isinstance(web_result, dict) and web_result.get("results"):
+                        result = web_result
 
                 # B方案：检测工具返回结果是否包含 error 字段
                 if isinstance(result, dict) and result.get("error"):

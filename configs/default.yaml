@@ -2,8 +2,12 @@
 
 # Connection details and API keys belong in .env.local.
 model:
-  backend: "deepseek"
+  backend: "qwen"
   backend_sampling:
+    qwen:
+      temperature: 0.2
+      max_tokens: 4096
+      top_p: 1.0
     deepseek:
       temperature: 0.5
       max_tokens: 4096
@@ -19,9 +23,9 @@ model:
         temperature: 0.3
         max_tokens: 8192
   backend_mapping:
-    planner: "deepseek"
-    solver: "deepseek"
-    summarizer: "deepseek"
+    planner: "qwen"
+    solver: "qwen"
+    summarizer: "qwen"
 
 orchestrator:
   max_concurrent: 5
@@ -37,9 +41,19 @@ research:
 
 evidence:
   enabled: true
+  verification_enabled: true
   db_path: "data/evidence.db"
   support_threshold: 0.22
   partial_threshold: 0.08
+
+quality_control:
+  adversarial_enabled: true
+  adversarial_backend: deterministic
+  adversarial_max_tokens: 2048
+  compression_enabled: true
+  memory_enabled: true
+  compression_target_ratio: 0.65
+  max_adversarial_rounds: 2
 
 tools:
   mock_mode: false

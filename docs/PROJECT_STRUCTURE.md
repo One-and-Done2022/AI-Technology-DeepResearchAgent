@@ -1,6 +1,6 @@
 # 项目目录与配置说明
 
-本文对应精简后的 AI Technology Research Agent。仓库只保留两个运行入口、两份 YAML 配置和一套领域评测。
+本文对应 AI Technology DeepResearch Agent。仓库保留单题运行、夜间预检、四系统主 benchmark、三份 YAML 配置和一套领域评测。
 
 ## 顶层目录
 
@@ -8,6 +8,7 @@
 deepresearch-agent/
 ├── configs/                 # 非敏感运行参数
 │   ├── default.yaml         # 真实 API 默认配置
+│   ├── benchmark.yaml       # 外部 API 可复现实验配置
 │   └── smoke.yaml           # 本地 vLLM + Mock 工具冒烟配置
 ├── docs/                    # 架构、STAR 和简历材料
 ├── evaluation/              # TechResearchBench 与自动评分
@@ -28,11 +29,14 @@ deepresearch-agent/
 | `agents/` | Agent 行为层；执行工具循环与最终报告合成 | `researcher.py`, `summarizer.py` |
 | `core/` | 模块装配、配置加载、单次研究运行与输出序列化 | `runner.py` |
 | `evidence/` | Source/Claim 模型、来源归一化、证据核验和 SQLite 存储 | `schemas.py`, `extractor.py`, `verifier.py`, `store.py` |
+| `adversarial/` | 确定性/可选 LLM Red-Blue 审计、JSON fallback、修复动作、收敛和震荡统计 | `audit.py`, `llm_loop.py`, `json_fallback.py` |
+| `compressor/` | L1/L2/L3 证据保留上下文压缩和 token 统计 | `context.py` |
+| `memory/` | 基于 NumPy 的共享来源向量索引、去重和检索 | `evidence_memory.py` |
 | `models/` | OpenAI-compatible 客户端和后端路由 | `model_router.py`, `vllm_policy.py` |
 | `orchestrator/` | DAG 分层并发、超时、重规划、研究轮次与降级报告 | `orchestrator.py`, `agent_pool.py`, `schemas.py` |
 | `planner/` | 将技术问题拆成搜索、分析、验证任务 | `planner.py`, `dag.py` |
 | `research/` | IterResearch 工作区；判断是否补搜或停止 | `workspace.py` |
-| `tools/` | Web、浏览器、论文、GitHub、计算、沙箱、文件和笔记工具 | `web_search.py`, `github_reader.py` 等 |
+| `tools/` | Web、OpenAlex、浏览器、论文、GitHub、计算、沙箱、文件和笔记工具 | `web_search.py`, `arxiv_reader.py`, `github_reader.py` 等 |
 | `utils/` | 环境变量加载和可选追踪 | `env_config.py`, `tracing.py` |
 
 主数据流：
@@ -53,7 +57,10 @@ Query
 
 ```text
 evaluation/
-├── benchmarks/tech_research_bench.py    # 数据加载、单题评分、分组汇总
+├── benchmarks/tech_research_bench.py    # TechResearchBench 数据加载和评分
+├── benchmarks/research_bench.py         # 35 题、11 领域历史兼容集
+├── benchmarks/hotpotqa.py               # HotpotQA EM/F1/pass@1 适配器
+├── judge.py                              # DeepSeek 外部报告/Claim Judge
 ├── datasets/tech_research_mini.jsonl    # 30 道、5 类领域题
 ├── fixtures/tech_benchmark_smoke.jsonl  # 仅测试评分脚本，不能当模型结果
 └── metrics/
@@ -66,7 +73,8 @@ evaluation/
 | 命令 | 用途 |
 |---|---|
 | `run-research` / `scripts/run_single.py` | 执行一个研究问题，输出 Markdown 和结构化 JSON |
-| `run-tech-benchmark` / `scripts/run_tech_benchmark.py` | 运行或重评 direct/single_round/evidence 对照实验 |
+| `scripts/preflight_overnight.py` | 检查生成、Judge 和搜索 API 是否可用 |
+| `run-tech-benchmark` / `scripts/run_tech_benchmark.py` | 运行或重评四级主能力对照实验，支持并发和断点续跑；可选 legacy IterResearch 对照 |
 
 ## YAML 配置原则
 
@@ -82,7 +90,7 @@ YAML 只保存非敏感行为参数；API Key、Base URL、模型名和工具连
 
 | 键 | 含义 |
 |---|---|
-| `backend` | 默认 LLM 后端，例如 `deepseek` 或 `vllm` |
+| `backend` | 默认生成后端，当前正式实验使用 `qwen` |
 | `backend_sampling.<backend>` | 该后端的默认 temperature/max_tokens/top_p |
 | `backend_sampling.modules.planner` | Planner 结构化 JSON 参数 |
 | `backend_sampling.modules.solver` | Researcher 参数 |
@@ -114,6 +122,7 @@ YAML 只保存非敏感行为参数；API Key、Base URL、模型名和工具连
 | 键 | 默认值 | 含义 |
 |---|---:|---|
 | `enabled` | true | 是否持久化结构化证据 |
+| `verification_enabled` | true | 是否执行生成阶段的离线 Claim–Evidence 核验 |
 | `db_path` | `data/evidence.db` | SQLite 路径 |
 | `support_threshold` | 0.22 | claim 与证据达到 supported 的覆盖阈值 |
 | `partial_threshold` | 0.08 | partially_supported 阈值 |
@@ -137,10 +146,15 @@ YAML 只保存非敏感行为参数；API Key、Base URL、模型名和工具连
 cp .env.template .env.local
 ```
 
-默认 DeepSeek + 博查组合至少需要：
+SiliconFlow Qwen 生成、DeepSeek Judge 与博查搜索至少需要：
 
 ```dotenv
+QWEN_API_KEY=...
+QWEN_BASE_URL=https://api.siliconflow.cn/v1
+QWEN_MODEL=Qwen/Qwen2.5-7B-Instruct
 DEEPSEEK_API_KEY=...
+DEEPSEEK_BASE_URL=https://api.siliconflow.cn/v1
+DEEPSEEK_MODEL=deepseek-ai/DeepSeek-V4-Flash
 SEARCH_BACKEND=bocha
 BOCHA_API_KEY=...
 ARXIV_READER_BACKEND=openalex

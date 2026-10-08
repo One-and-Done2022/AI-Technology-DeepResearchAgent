@@ -29,7 +29,7 @@ __all__ = [
 class OrchestratorState(Enum):
     """研究编排状态机。
 
-    正常流: IDLE → PLANNING → DISPATCHING → COLLECTING → SYNTHESIZING → DONE
+    正常流: IDLE → PLANNING → DISPATCHING → COLLECTING → SYNTHESIZING → FINALIZING → DONE
     异常流:
       - 局部失败 → REPLANNING (增量重规划) → DISPATCHING
       - 全局失败 / 超过最大重规划次数 → FAILED
@@ -39,6 +39,7 @@ class OrchestratorState(Enum):
     DISPATCHING = "dispatching"
     COLLECTING = "collecting"
     SYNTHESIZING = "synthesizing"
+    FINALIZING = "finalizing"
     REPLANNING = "replanning"
     DONE = "done"
     FAILED = "failed"
@@ -135,6 +136,7 @@ class ResearchReport:
     research_rounds: list[dict[str, Any]] = field(default_factory=list)
     evidence_metrics: dict[str, Any] = field(default_factory=dict)
     runtime_metrics: dict[str, Any] = field(default_factory=dict)
+    verification_applicability: bool = True
     run_id: str = ""
 
 
@@ -150,7 +152,13 @@ class RunConfig:
     max_concurrent: int = 5
     global_timeout_seconds: int = 600
     max_replan_rounds: int = 3
+    max_plan_tasks: int = 8
     enable_iterative_research: bool = True
     max_research_rounds: int = 2
     min_sources_per_task: int = 2
     max_followup_tasks: int = 3
+    enable_adversarial_audit: bool = False
+    enable_context_compression: bool = False
+    enable_shared_memory: bool = False
+    compression_target_ratio: float = 0.65
+    max_adversarial_rounds: int = 2

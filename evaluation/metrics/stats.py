@@ -34,7 +34,8 @@ def bootstrap_ci_paired(
         dict with mean_diff, ci_lower, ci_upper, p_value, significant
     """
     if not diffs:
-        return {"mean_diff": 0.0, "ci_lower": 0.0, "ci_upper": 0.0, "p_value": 1.0, "significant": False}
+        return {"mean_diff": 0.0, "ci_lower": 0.0, "ci_upper": 0.0,
+                "p_value": 1.0, "significant": False, "insufficient_n": True, "n": 0}
 
     diffs_arr = np.array(diffs)
     mean_diff = float(np.mean(diffs_arr))
@@ -44,20 +45,24 @@ def bootstrap_ci_paired(
         sample = np.random.choice(diffs_arr, size=len(diffs_arr), replace=True)
         boot_means.append(float(np.mean(sample)))
 
-    boot_means = np.array(boot_means)
+    boot_means_arr = np.array(boot_means)
     alpha = 1 - confidence
-    ci_lower = float(np.percentile(boot_means, alpha / 2 * 100))
-    ci_upper = float(np.percentile(boot_means, (1 - alpha / 2) * 100))
+    ci_lower = float(np.percentile(boot_means_arr, alpha / 2 * 100))
+    ci_upper = float(np.percentile(boot_means_arr, (1 - alpha / 2) * 100))
 
-    # p-value: H0 mean_diff <= 0
-    p_value = float(np.mean(boot_means <= 0))
+    # Two-sided bootstrap tail probability around the null value 0.
+    p_value = float(2 * min(np.mean(boot_means_arr <= 0), np.mean(boot_means_arr >= 0)))
+    p_value = min(1.0, p_value)
 
     return {
         "mean_diff": round(mean_diff, 4),
         "ci_lower": round(ci_lower, 4),
         "ci_upper": round(ci_upper, 4),
         "p_value": round(p_value, 4),
-        "significant": ci_lower > 0,  # 95% CI 完全在 0 右侧
+        # A one-pair bootstrap is descriptive only: its degenerate CI must
+        # never be presented as statistical significance.
+        "significant": len(diffs) >= 2 and (ci_lower > 0 or ci_upper < 0),
+        "insufficient_n": len(diffs) < 2,
         "n": len(diffs),
     }
 
@@ -76,7 +81,9 @@ def bootstrap_ci_two_sample(
         scores_b: 系统 B 的分数列表
     """
     if not scores_a or not scores_b:
-        return {"mean_diff": 0.0, "ci_lower": 0.0, "ci_upper": 0.0, "p_value": 1.0, "significant": False}
+        return {"mean_diff": 0.0, "ci_lower": 0.0, "ci_upper": 0.0,
+                "p_value": 1.0, "significant": False, "insufficient_n": True,
+                "n_a": 0, "n_b": 0}
 
     a_arr = np.array(scores_a)
     b_arr = np.array(scores_b)
@@ -88,18 +95,20 @@ def bootstrap_ci_two_sample(
         b_sample = np.random.choice(b_arr, size=len(b_arr), replace=True)
         boot_diffs.append(float(np.mean(a_sample) - np.mean(b_sample)))
 
-    boot_diffs = np.array(boot_diffs)
+    boot_diffs_arr = np.array(boot_diffs)
     alpha = 1 - confidence
-    ci_lower = float(np.percentile(boot_diffs, alpha / 2 * 100))
-    ci_upper = float(np.percentile(boot_diffs, (1 - alpha / 2) * 100))
-    p_value = float(np.mean(boot_diffs <= 0))
+    ci_lower = float(np.percentile(boot_diffs_arr, alpha / 2 * 100))
+    ci_upper = float(np.percentile(boot_diffs_arr, (1 - alpha / 2) * 100))
+    p_value = float(2 * min(np.mean(boot_diffs_arr <= 0), np.mean(boot_diffs_arr >= 0)))
+    p_value = min(1.0, p_value)
 
     return {
         "mean_diff": round(mean_diff, 4),
         "ci_lower": round(ci_lower, 4),
         "ci_upper": round(ci_upper, 4),
         "p_value": round(p_value, 4),
-        "significant": ci_lower > 0,
+        "significant": min(len(scores_a), len(scores_b)) >= 2 and (ci_lower > 0 or ci_upper < 0),
+        "insufficient_n": min(len(scores_a), len(scores_b)) < 2,
         "n_a": len(scores_a),
         "n_b": len(scores_b),
     }
@@ -113,6 +122,14 @@ def cohens_d(scores_a: list[float], scores_b: list[float]) -> float:
     if pooled_std < 1e-9:
         return 0.0
     return float((np.mean(a_arr) - np.mean(b_arr)) / pooled_std)
+
+
+def paired_cohens_dz(diffs: list[float]) -> float:
+    """Paired Cohen's dz: mean paired difference divided by sample SD."""
+    if len(diffs) < 2:
+        return 0.0
+    std = float(np.std(np.array(diffs), ddof=1))
+    return 0.0 if std < 1e-9 else float(np.mean(diffs) / std)
 
 
 def paired_t_test(scores_a: list[float], scores_b: list[float]) -> dict[str, Any]:

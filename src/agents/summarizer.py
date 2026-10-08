@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 from .base_agent import BaseAgent
 from ..evidence.extractor import EvidencePipeline
@@ -64,7 +65,13 @@ class SummarizerAgent(BaseAgent):
 
         # 构建 synthesis prompt
         sources = self._collect_sources(results)
-        prompt = self._build_synthesis_prompt(query, results, sources)
+        prompt = self._build_synthesis_prompt(
+            query,
+            results,
+            sources,
+            compressed_context=context.get("compressed_context", ""),
+            memory_context=context.get("memory_context", []),
+        )
         messages = [
             {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": prompt},
@@ -116,6 +123,8 @@ class SummarizerAgent(BaseAgent):
         query: str,
         results: list[AgentResult],
         sources: list[dict[str, Any]],
+        compressed_context: str = "",
+        memory_context: list[dict[str, Any]] | None = None,
     ) -> str:
         """构建合成 prompt，按置信度降序排列结果。"""
         sorted_results = sorted(results, key=lambda r: r.confidence, reverse=True)
@@ -132,6 +141,22 @@ class SummarizerAgent(BaseAgent):
                 f"Output:\n{r.output}\n"
             )
 
+        if compressed_context:
+            parts.append(
+                "\n# Compressed Evidence Context\n"
+                "The following context was selected by the evidence-preserving compressor. "
+                "Keep cited evidence and do not infer unsupported facts.\n"
+                f"{compressed_context}\n"
+            )
+
+        if memory_context:
+            parts.append("\n# Reusable Evidence Memory\n")
+            for item in memory_context:
+                parts.append(
+                    f"- {item.get('title') or 'Untitled'}: "
+                    f"{item.get('quote') or item.get('snippet', '')[:500]}\n"
+                )
+
         parts.append(f"\n# Evidence Catalog ({len(sources)} sources)\n")
         for source in sources:
             parts.append(
@@ -141,6 +166,12 @@ class SummarizerAgent(BaseAgent):
                 f"Evidence excerpt: {(source.get('quote') or source.get('snippet', ''))[:1200]}\n"
             )
 
+        evidence_instruction = (
+            "8. EVIDENCE-FIRST MODE: draft factual claims only from an exact catalog excerpt. "
+            "If no excerpt directly supports a claim, omit it or mark it as unresolved. "
+            "Recommendations must be explicitly labeled as analysis, not fact.\n"
+            if self.evidence_pipeline.verify else ""
+        )
         parts.append(
             "\n# Instructions\n"
             "1. Directly write the report; do not describe a future plan.\n"
@@ -149,7 +180,8 @@ class SummarizerAgent(BaseAgent):
             "4. Use only evidence catalog IDs. If evidence is insufficient, explicitly write '证据不足'.\n"
             "5. Explain source conflicts and avoid converting inference into fact.\n"
             "6. For technology selection questions, include a comparison table.\n"
-            "7. End with a short confidence and limitations section."
+            "7. End with a short confidence and limitations section.\n"
+            + evidence_instruction
         )
         return "\n".join(parts)
 
@@ -167,6 +199,7 @@ class SummarizerAgent(BaseAgent):
         success_rate = success / max(total, 1)
 
         claims, evidence_metrics = self.evidence_pipeline.refresh(content, sources)
+        content = self.evidence_pipeline.annotate_citations(content, claims)
         evidence_confidence = float(evidence_metrics.get("citation_entailment", 0.0))
         citation_coverage = float(evidence_metrics.get("citation_coverage", 0.0))
         confidence = round(
@@ -192,7 +225,7 @@ class SummarizerAgent(BaseAgent):
 
     @staticmethod
     def _collect_sources(results: list[AgentResult]) -> list[dict[str, Any]]:
-        unique: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
         seen: set[str] = set()
         for result in results:
             if result.status != AgentStatus.SUCCESS:
@@ -203,9 +236,30 @@ class SummarizerAgent(BaseAgent):
                 if not key or key in seen:
                     continue
                 seen.add(key)
-                source["source_id"] = f"S{len(unique) + 1}"
                 source.setdefault("quote", source.get("snippet", ""))
                 source.setdefault("snippet", source.get("quote", ""))
                 source["task_id"] = result.task_id
-                unique.append(source)
+                candidates.append(source)
+        ranked = sorted(candidates, key=lambda item: float(item.get("quality_score", 0.0)), reverse=True)
+        unique: list[dict[str, Any]] = []
+        per_host: dict[str, int] = {}
+
+        def add_source(source: dict[str, Any]) -> bool:
+            host = (urlparse(str(source.get("url", ""))).hostname or "").lower()
+            if per_host.get(host, 0) >= 3 or source in unique:
+                return False
+            unique.append(source)
+            per_host[host] = per_host.get(host, 0) + 1
+            return len(unique) >= 12
+
+        for source in ranked:
+            excerpt = str(source.get("quote") or source.get("snippet", "")).strip()
+            if len(excerpt) >= 40 and add_source(source):
+                break
+        if len(unique) < 12:
+            for source in ranked:
+                if add_source(source):
+                    break
+        for index, source in enumerate(unique, 1):
+            source["source_id"] = f"S{index}"
         return unique

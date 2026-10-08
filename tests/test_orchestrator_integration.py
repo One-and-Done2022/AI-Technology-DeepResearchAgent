@@ -4,6 +4,9 @@ import asyncio
 import json
 
 from src.evidence.store import EvidenceStore
+from src.adversarial import RedBlueAuditor
+from src.compressor import EvidencePreservingCompressor
+from src.memory import EvidenceMemory
 from src.orchestrator.agent_pool import AgentPool
 from src.orchestrator.orchestrator import Orchestrator
 from src.orchestrator.schemas import RunConfig
@@ -99,5 +102,38 @@ def test_orchestrator_persists_structured_evidence(tmp_path) -> None:
     assert report.claims
     assert report.evidence_metrics["citation_coverage"] == 1.0
     assert report.runtime_metrics["subtask_success_count"] == 1
+    assert report.runtime_metrics["finalization_state"] == "finalizing"
     assert store.load_report(report.run_id) is not None
     assert all(stats["active"] == 0 for stats in pool.get_stats().values())
+
+
+def test_full_stack_quality_modules_are_in_runtime_path(tmp_path) -> None:
+    planner = Planner(PlannerPolicy())
+    pool = AgentPool(
+        policy_factory=WorkerPolicy,
+        tools_factory=lambda: [MockWebSearchTool(delay_ms=(0, 0))],
+    )
+    orchestrator = Orchestrator(
+        planner=planner,
+        agent_pool=pool,
+        summarizer_policy=SummarizerPolicy(),
+        evidence_store=EvidenceStore(str(tmp_path / "full_stack.db")),
+        red_blue_auditor=RedBlueAuditor(),
+        context_compressor=EvidencePreservingCompressor(),
+        shared_memory=EvidenceMemory(),
+    )
+    report = asyncio.run(
+        orchestrator.run(
+            "Research Transformer architecture",
+            RunConfig(
+                enable_iterative_research=False,
+                enable_adversarial_audit=True,
+                enable_context_compression=True,
+                enable_shared_memory=True,
+            ),
+        )
+    )
+    assert "compression_ratio" in report.runtime_metrics
+    assert report.runtime_metrics["memory_size"] >= 1
+    assert "red_issue_count" in report.runtime_metrics
+    assert report.runtime_metrics["finalization_state"] == "finalizing"

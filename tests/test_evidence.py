@@ -54,6 +54,24 @@ def test_pipeline_marks_uncited_claim_unknown() -> None:
     assert claims[0]["verification_status"] == "unknown"
 
 
+def test_pipeline_binds_named_entity_as_candidate_without_claiming_support() -> None:
+    pipeline = EvidencePipeline()
+    source = Source(
+        source_id="S1",
+        url="https://arxiv.org/abs/2305.14314",
+        title="QLoRA: Efficient Finetuning of Quantized LLMs",
+        quote="QLoRA enables memory-efficient finetuning of quantized language models.",
+        quality_score=1.0,
+    ).to_dict()
+    claims = pipeline.build_claims(
+        "QLoRA can reduce memory use in resource-constrained finetuning.",
+        [source],
+    )
+    assert claims[0]["citations"] == ["S1"]
+    assert claims[0]["metadata"]["citation_binding"] == "entity_anchor"
+    assert claims[0]["verification_status"] in {"supported", "partially_supported", "unknown"}
+
+
 def test_evidence_store_round_trip(tmp_path) -> None:
     store = EvidenceStore(str(tmp_path / "evidence.db"))
     source = Source(

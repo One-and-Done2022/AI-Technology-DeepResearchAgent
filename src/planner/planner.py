@@ -128,7 +128,9 @@ class Planner:
     # ------------------------------------------------------------------
 
     @trace_chain(name="planner.generate_plan", tags=["m2", "planner"])
-    def generate_plan(self, query: str, memory_context: str = "") -> DAG:
+    def generate_plan(
+        self, query: str, memory_context: str = "", max_tasks: int | None = None
+    ) -> DAG:
         """生成初始执行计划（DAG）。
 
         Args:
@@ -141,7 +143,7 @@ class Planner:
         Raises:
             PlanParseError: LLM 输出无法解析为合法 DAG 时抛出。
         """
-        prompt = self._build_prompt(query, memory_context)
+        prompt = self._build_prompt(query, memory_context, max_tasks=max_tasks)
         messages = [
             {"role": "system", "content": "You are a research planning assistant. Output valid JSON only."},
             {"role": "user", "content": prompt},
@@ -157,7 +159,7 @@ class Planner:
         # 估算 planning token 消耗
         self.budget_tracker.track(len(content) // 3)
 
-        return self._parse_plan(content)
+        return self._parse_plan(content, max_tasks=max_tasks)
 
     @trace_chain(name="planner.replan", tags=["m2", "planner"])
     def replan(
@@ -222,7 +224,7 @@ class Planner:
     # 内部方法
     # ------------------------------------------------------------------
 
-    def _build_prompt(self, query: str, memory: str) -> str:
+    def _build_prompt(self, query: str, memory: str, max_tasks: int | None = None) -> str:
         """构建初始规划 prompt。"""
         # 首次运行（无历史记忆）时，提示 Planner 更激进地拆解子任务
         has_memory = bool(memory and memory.strip() and memory != "None")
@@ -230,8 +232,7 @@ class Planner:
             extra_hint = (
                 "\n## Note\n"
                 "No previous research memory is available for this topic. "
-                "Please be MORE AGGRESSIVE in decomposition: generate 6-10 sub_tasks to thoroughly cover the topic, "
-                "rather than the usual 3-5. Each sub-task should focus on a distinct angle or data source.\n"
+                "Generate a compact plan with distinct tasks and avoid redundant verification work.\n"
                 "IMPORTANT: Each sub-task description must directly reflect the user's original intent. "
                 "If the user asks about 'internship application strategies', do NOT generate tasks about '2025 tech trends' or 'annual science summary'."
             )
@@ -241,9 +242,14 @@ class Planner:
                 "Use the preserved successful results above to inform new sub-tasks. "
                 "New tasks should fill gaps and avoid duplicating existing coverage."
             )
+        if max_tasks is not None and max_tasks > 0:
+            extra_hint += (
+                f"\nFor this benchmark, output at most {int(max_tasks)} sub_tasks. "
+                "Prioritize one core search task, one analysis/comparison task, and one verification task when relevant."
+            )
         return INITIAL_PLAN_PROMPT.format(query=query, memory_context=memory or "None") + extra_hint
 
-    def _parse_plan(self, json_str: str) -> DAG:
+    def _parse_plan(self, json_str: str, max_tasks: int | None = None) -> DAG:
         """健壮性 JSON 解析：处理 markdown 代码块、多余换行等噪声。
 
         解析策略:
@@ -302,6 +308,30 @@ class Planner:
         sub_tasks_raw = data["sub_tasks"]
         if not isinstance(sub_tasks_raw, list):
             raise PlanParseError(f"'sub_tasks' must be a list, got {type(sub_tasks_raw)}")
+
+        if max_tasks is not None and max_tasks > 0 and len(sub_tasks_raw) > max_tasks:
+            # Deterministic cap for external benchmarks. Keep the model's
+            # original order (usually the broad-to-specific research order),
+            # but retain a verification task when one exists.
+            selected = list(sub_tasks_raw[:max_tasks])
+            verification = next(
+                (item for item in sub_tasks_raw
+                 if item not in selected and (
+                     item.get("task_type") == "verify" or item.get("verification_required")
+                 )),
+                None,
+            )
+            if verification is not None and not any(
+                item.get("task_type") == "verify" or item.get("verification_required")
+                for item in selected
+            ):
+                selected[-1] = verification
+            selected_ids = {str(item.get("task_id", "")) for item in selected}
+            for item in selected:
+                item["dependencies"] = [
+                    dep for dep in item.get("dependencies", []) if str(dep) in selected_ids
+                ]
+            sub_tasks_raw = selected
 
         dag = DAG()
         for item in sub_tasks_raw:
@@ -377,5 +407,8 @@ class Planner:
             return {}
 
         sub_tasks_raw = data.get("sub_tasks", [])
-        return {item.get("task_id", f"task_{i}"): self._deserialize_subtask(item)
-                for i, item in enumerate(sub_tasks_raw)}
+        task_map = {
+            item.get("task_id", f"task_{i}"): self._deserialize_subtask(item)
+            for i, item in enumerate(sub_tasks_raw)
+        }
+        return {task_id: task for task_id, task in task_map.items() if dag.has_node(task_id)}

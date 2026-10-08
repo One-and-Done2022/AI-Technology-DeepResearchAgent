@@ -36,6 +36,14 @@ research:
 
 evidence:
   enabled: true
+  verification_enabled: true
+
+quality_control:
+  adversarial_enabled: false
+  adversarial_backend: deterministic
+  adversarial_max_tokens: 512
+  compression_enabled: false
+  memory_enabled: false
   db_path: "outputs/smoke/evidence.db"
   support_threshold: 0.22
   partial_threshold: 0.08

@@ -31,6 +31,9 @@ def ensure_env_loaded() -> None:
     if _ENV_LOADED:
         return
 
+    # 显式导出的进程环境优先级最高，便于 benchmark 临时切换后端。
+    process_env = dict(os.environ)
+
     # 1. 加载项目级 .env
     env_path = os.path.join(os.getcwd(), ".env")
     if os.path.exists(env_path):
@@ -40,6 +43,9 @@ def ensure_env_loaded() -> None:
     local_env = os.path.join(os.getcwd(), ".env.local")
     if os.path.exists(local_env):
         load_dotenv(dotenv_path=local_env, override=True)
+
+    # 恢复调用方显式设置的环境变量：shell > .env.local > .env。
+    os.environ.update(process_env)
 
     _ENV_LOADED = True
 

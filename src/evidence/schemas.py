@@ -26,6 +26,19 @@ class VerificationStatus(str, Enum):
     UNKNOWN = "unknown"
 
 
+class ClaimType(str, Enum):
+    DEFINITION = "definition"
+    MECHANISM = "mechanism"
+    COMPARISON = "comparison"
+    PERFORMANCE = "performance"
+    COST = "cost"
+    TEMPORAL = "temporal"
+    ADOPTION = "adoption"
+    LICENSE = "license"
+    RECOMMENDATION = "recommendation"
+    NEGATIVE = "negative"
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -89,6 +102,7 @@ class EvidenceSpan:
 class Claim:
     claim_id: str
     statement: str
+    claim_type: ClaimType = ClaimType.DEFINITION
     citations: list[str] = field(default_factory=list)
     evidence: list[EvidenceSpan] = field(default_factory=list)
     verification_status: VerificationStatus = VerificationStatus.UNKNOWN
@@ -98,6 +112,7 @@ class Claim:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        data["claim_type"] = self.claim_type.value
         data["verification_status"] = self.verification_status.value
         data["evidence"] = [item.to_dict() for item in self.evidence]
         return data
@@ -105,6 +120,10 @@ class Claim:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Claim":
         payload = dict(data)
+        try:
+            payload["claim_type"] = ClaimType(payload.get("claim_type", "definition"))
+        except ValueError:
+            payload["claim_type"] = ClaimType.DEFINITION
         try:
             payload["verification_status"] = VerificationStatus(
                 payload.get("verification_status", "unknown")

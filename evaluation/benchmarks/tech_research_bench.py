@@ -57,6 +57,7 @@ class TechResearchBench:
             report,
             expected_topics=case.get("expected_topics", []),
             required_claims=case.get("required_claims", []),
+            gold_source_patterns=case.get("gold_source_patterns", []),
             answerable=bool(case.get("answerable", True)),
         )
         return {
@@ -64,7 +65,7 @@ class TechResearchBench:
             "category": case.get("category", ""),
             "difficulty": case.get("difficulty", ""),
             "metrics": metrics,
-            "composite_score": metrics["composite_score"],
+            "content_score": metrics["content_score"],
         }
 
     @staticmethod
@@ -79,7 +80,10 @@ class TechResearchBench:
             }
         )
         averages = {
-            metric: sum(result["metrics"].get(metric, 0.0) for result in results) / len(results)
+            metric: sum(
+                value for result in results
+                if (value := result["metrics"].get(metric)) is not None
+            ) / max(1, sum(result["metrics"].get(metric) is not None for result in results))
             for metric in metric_names
         }
         by_category: dict[str, dict[str, float]] = {}
@@ -87,7 +91,10 @@ class TechResearchBench:
         for category in categories:
             selected = [result for result in results if result.get("category") == category]
             by_category[category] = {
-                metric: sum(item["metrics"].get(metric, 0.0) for item in selected) / len(selected)
+                metric: sum(
+                    value for item in selected
+                    if (value := item["metrics"].get(metric)) is not None
+                ) / max(1, sum(item["metrics"].get(metric) is not None for item in selected))
                 for metric in metric_names
             }
         return {

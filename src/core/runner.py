@@ -173,14 +173,19 @@ def initialize_modules(config: dict) -> dict[str, Any]:
 
     # 默认后端（所有模块共用）
     default_kwargs = _get_sampling_kwargs("default", default_backend)
-    default_policy = ModelRouter.create_backend(default_backend, **default_kwargs)
+    fresh_models = bool(model_cfg.get("fresh_instances", False))
+    default_policy = ModelRouter.create_backend(
+        default_backend, fresh_instance=fresh_models, **default_kwargs
+    )
     modules["default_policy"] = default_policy
     logger.info(f"[LLM] 默认后端已加载: {default_backend} ({default_kwargs})")
 
     # 多后端分工：不同模块用不同后端 + 不同采样参数
     for module_name, backend_name in backend_mapping.items():
         kwargs = _get_sampling_kwargs(module_name, backend_name)
-        modules[f"{module_name}_policy"] = ModelRouter.create_backend(backend_name, **kwargs)
+        modules[f"{module_name}_policy"] = ModelRouter.create_backend(
+            backend_name, fresh_instance=fresh_models, **kwargs
+        )
         logger.info(f"[LLM] {module_name} → 后端={backend_name}, 采样={kwargs}")
 
     # 若未配置分工，所有模块回退到 default_policy
@@ -197,6 +202,7 @@ def initialize_modules(config: dict) -> dict[str, Any]:
     logger.info("Planner 模块已初始化")
 
     evidence_cfg = config.get("evidence", {})
+    quality_cfg = config.get("quality_control", {})
     evidence_store = None
     from src.evidence.extractor import EvidencePipeline
     from src.evidence.verifier import EvidenceVerifier
@@ -205,7 +211,8 @@ def initialize_modules(config: dict) -> dict[str, Any]:
         EvidenceVerifier(
             support_threshold=float(evidence_cfg.get("support_threshold", 0.22)),
             partial_threshold=float(evidence_cfg.get("partial_threshold", 0.08)),
-        )
+        ),
+        verify=bool(evidence_cfg.get("verification_enabled", True)),
     )
     if evidence_cfg.get("enabled", True):
         from src.evidence.store import EvidenceStore
@@ -213,6 +220,27 @@ def initialize_modules(config: dict) -> dict[str, Any]:
         evidence_store = EvidenceStore(evidence_cfg.get("db_path", "data/evidence.db"))
         modules["evidence_store"] = evidence_store
         logger.info("[Evidence] Claim-Evidence Store 已初始化")
+
+    from src.adversarial import LLMRedBlueAuditor, RedBlueAuditor
+    from src.compressor import EvidencePreservingCompressor
+    from src.memory import EvidenceMemory
+
+    red_blue_auditor = RedBlueAuditor(
+        max_rounds=int(quality_cfg.get("max_adversarial_rounds", 2)),
+        expose_audit=bool(quality_cfg.get("expose_audit", True)),
+    )
+    if str(quality_cfg.get("adversarial_backend", "deterministic")).lower() == "llm":
+        red_blue_auditor = LLMRedBlueAuditor(
+            policy=modules.get("solver_policy", default_policy),
+            max_rounds=int(quality_cfg.get("max_adversarial_rounds", 2)),
+            max_tokens=int(quality_cfg.get("adversarial_max_tokens", 2048)),
+            fallback=red_blue_auditor,
+        )
+    context_compressor = EvidencePreservingCompressor()
+    shared_memory = EvidenceMemory()
+    modules["red_blue_auditor"] = red_blue_auditor
+    modules["context_compressor"] = context_compressor
+    modules["shared_memory"] = shared_memory
 
     # Tools（真实工具或 Mock 工具）
     tools_list = _create_tools_factory(config)
@@ -231,6 +259,7 @@ def initialize_modules(config: dict) -> dict[str, Any]:
             "max_tool_calls": int(config.get("research", {}).get("max_tool_calls", 6)),
             "support_threshold": float(evidence_cfg.get("support_threshold", 0.22)),
             "partial_threshold": float(evidence_cfg.get("partial_threshold", 0.08)),
+            "verify_evidence": bool(evidence_cfg.get("verification_enabled", True)),
         },
     )
     modules["agent_pool"] = agent_pool
@@ -242,6 +271,9 @@ def initialize_modules(config: dict) -> dict[str, Any]:
         summarizer_policy=modules.get("summarizer_policy", default_policy),
         evidence_store=evidence_store,
         evidence_pipeline=evidence_pipeline,
+        red_blue_auditor=red_blue_auditor,
+        context_compressor=context_compressor,
+        shared_memory=shared_memory,
     )
     modules["orchestrator"] = orchestrator
     logger.info("Orchestrator 模块已初始化")
@@ -252,7 +284,9 @@ def initialize_modules(config: dict) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 研究流程主函数
 # ---------------------------------------------------------------------------
-async def run_research_report(query: str, config: dict, modules: dict[str, Any]):
+async def run_research_report(
+    query: str, config: dict, modules: dict[str, Any], close_shared_tools: bool = True
+):
     """Run the workflow and return the structured ResearchReport."""
     logger = logging.getLogger("runner")
     logger.info(f"开始研究，查询: {query[:80]}...")
@@ -260,23 +294,44 @@ async def run_research_report(query: str, config: dict, modules: dict[str, Any])
     from src.orchestrator.schemas import RunConfig
 
     research_cfg = config.get("research", {})
+    quality_cfg = config.get("quality_control", {})
     run_cfg = RunConfig(
         max_concurrent=config.get("orchestrator", {}).get("max_concurrent", 5),
         global_timeout_seconds=config.get("orchestrator", {}).get("global_timeout_seconds", 600),
         max_replan_rounds=config.get("orchestrator", {}).get("max_replan_rounds", 3),
+        max_plan_tasks=config.get("orchestrator", {}).get("max_plan_tasks", 8),
         enable_iterative_research=research_cfg.get("enabled", True),
         max_research_rounds=research_cfg.get("max_rounds", 2),
         min_sources_per_task=research_cfg.get("min_sources_per_task", 2),
         max_followup_tasks=research_cfg.get("max_followup_tasks", 3),
+        enable_adversarial_audit=bool(quality_cfg.get("adversarial_enabled", False)),
+        enable_context_compression=bool(quality_cfg.get("compression_enabled", False)),
+        enable_shared_memory=bool(quality_cfg.get("memory_enabled", False)),
+        compression_target_ratio=float(quality_cfg.get("compression_target_ratio", 0.65)),
+        max_adversarial_rounds=int(quality_cfg.get("max_adversarial_rounds", 2)),
     )
 
     try:
         report = await orchestrator.run(query, config=run_cfg)
     finally:
         from src.tools.web_search import WebSearchTool
+        if close_shared_tools:
+            await WebSearchTool.close_session()
 
-        await WebSearchTool.close_session()
-
+    policies = {
+        id(policy): policy
+        for key, policy in modules.items()
+        if key.endswith("policy") and hasattr(policy, "usage_totals")
+    }
+    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "usage_estimated": False}
+    for policy in policies.values():
+        totals = policy.usage_totals
+        usage["input_tokens"] += int(totals.get("input_tokens", 0))
+        usage["output_tokens"] += int(totals.get("output_tokens", 0))
+        usage["total_tokens"] += int(totals.get("total_tokens", 0))
+        usage["usage_estimated"] = usage["usage_estimated"] or bool(totals.get("usage_estimated"))
+    report.runtime_metrics.update(usage)
+    report.verification_applicability = bool(config.get("evidence", {}).get("verification_enabled", True))
     logger.info(
         f"[Orchestrator] 报告生成完成 | 置信度={report.confidence:.2f} | "
         f"搜索轮数={report.num_searches} | 研究轮次={len(report.research_rounds)}"
@@ -379,6 +434,7 @@ def serialize_report(report) -> dict[str, Any]:
         "research_rounds": report.research_rounds,
         "evidence_metrics": report.evidence_metrics,
         "runtime_metrics": report.runtime_metrics,
+        "verification_applicability": report.verification_applicability,
     }
 
 
